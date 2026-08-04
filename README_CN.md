@@ -19,7 +19,7 @@
   - **责任链 (Chain of Responsibility)**: 通过 `Sanitizer` 服务串行执行配置的过滤器。
   - **结构化结果**: 规则返回 `CheckResult` 结构体，包含修正状态和原因说明。
 - **数据标准化 (Standardization)**:
-  - **精度统一**: 将浮点数转换为高精度的整型定点数 (Scaled Integer)，默认 10000 倍精度 (支持 4 位小数)。
+  - **精度统一**: 将浮点数转换为高精度的整型定点数 (Scaled Integer)，默认 10000 倍精度 (4 位小数)，可通过 `WithPrecision(factor)` 配置；转换采用 **int64 截断**。
   - **时间对齐 (Aligner)**: 使用**二分查找算法** O(log n) 将散乱的时间点对齐到标准的整点快照。
 - **并发安全**:
   - 异步操作带有超时控制和错误日志。
@@ -29,30 +29,42 @@
   - **Services (服务层)**: 业务流程编排 (`pkg/core/services`)，包含 Sanitizer 与 Standardizer 实现。
   - **Adapters (适配层)**: 外部交互实现 (`pkg/adapters`)，包含 Ingestors 和 Factory。
 
+## 🎬 快速体验 (Demo)
+
+无需编写代码即可感受完整流水线 (接入 → 清洗 → 标准化 → 查询)：
+
+```bash
+go run ./cmd/demo              # 脚本化演示 (内置脏数据样例)
+go run ./cmd/demo -ingest data.json   # 自喂数据 (.json / .csv)
+```
+
 ## 📂 项目结构
 
 ```
 prism-core/
+├── cmd/
+│   └── demo/          # 演示程序 (go run ./cmd/demo)
+├── docs/
+│   └── dev-guide/     # 开发手册 (六边形架构说明)
 ├── pkg/
 │   ├── adapters/      # 适配器层 (外部交互)
-│   │   ├── factory/      # 工厂模式实现 (如 RuleFactory)
-│   │   └── ingest/       # 数据摄入实现 (CSV, JSON)
+│   │   ├── factory/   #   规则工厂 (RuleFactory 规则实例化)
+│   │   └── ingest/    #   数据摄入实现 (CSV, JSON)
 │   └── core/
-│       ├── domain/        # 核心业务逻辑 (实体 & 接口)
+│       ├── domain/    # 核心业务逻辑 (实体 & 算法)
 │       │   ├── aligner.go    # 时间对齐逻辑
-│       │   ├── unifier.go    # 精度转换器
-│       │   ├── rule.go       # 规则定义
+│       │   ├── unifier.go    # 精度转换器 (math.Round)
+│       │   ├── rule.go       # 规则定义 (RuleType / RuleAction)
 │       │   └── ...
-│       ├── ports/         # 接口定义 (驱动/被驱动端口)
-│       └── services/      # 应用服务 (流程编排)
+│       ├── ports/     # 接口定义 (驱动/被驱动端口)
+│       └── services/  # 应用服务 (流程编排)
 │           ├── sanitizer.go  # 清洗器 (责任链)
-│           ├── rules/        # 具体清洗规则实现 (e.g. RangeRule)
+│           ├── rules/        # 内置规则: Range / Monotonic / Rate / Stagnation
 │           └── ...
-├── tests/                 # 外部集成测试
-│   ├── core/
-│   │   ├── services/      # 服务层测试
-│   │   └── ...
-└── testdata/              # 测试用例样本数据
+├── tests/             # 外部集成测试 (包均为 xxx_test)
+│   ├── adapters/      # 工厂与接入器测试
+│   └── core/          # 领域与服务层测试
+└── testdata/          # 测试用例样本数据
 ```
 
 ## 🚀 快速开始
@@ -68,6 +80,7 @@ go get github.com/renjie/prism-core
 ```go
 import (
     "context"
+    "fmt"
     "os"
     "github.com/renjie/prism-core/pkg/adapters/ingest"
     "github.com/renjie/prism-core/pkg/core/services"
@@ -160,6 +173,8 @@ sr, err := standardizer.GetStandardReading(ctx, "D1", t)
 按设备类型从仓储加载清洗规则时，需要同时注入规则仓储与规则工厂：
 
 ```go
+import "github.com/renjie/prism-core/pkg/adapters/factory" // 具体工厂实现 (基础设施层)
+
 standardizer := services.NewCoreStandardizer(
     services.WithRuleRepository(ruleRepo),   // 实现 ports.CleaningRuleRepository
     services.WithRuleFactory(factory.GetRuleFactory()), // ports.CleaningRuleFactory
@@ -177,10 +192,7 @@ standardizer := services.NewCoreStandardizer(
 
 ```bash
 # 运行所有测试
-go test ./tests/...
-
-# 运行特定测试并查看详细输出
-go test -v ./tests/core/services/
+go test ./...
 ```
 
 ## 📄 许可证

@@ -35,6 +35,11 @@ func (s *ChainSanitizer) Clean(readings []domain.Reading) ([]domain.Reading, []d
 	var prev *domain.Reading
 
 	for _, curr := range readings {
+		// 设备切换时重置上下文，避免跨设备的规则判定污染
+		if prev != nil && prev.DeviceInfo.ID != curr.DeviceInfo.ID {
+			prev = nil
+		}
+
 		// 0. 内置规则: 同设备下的时间戳去重
 		if prev != nil && prev.DeviceInfo.ID == curr.DeviceInfo.ID && prev.Timestamp.Equal(curr.Timestamp) {
 			// 重复数据视为 Dirty Data? 或者只是 Drop?

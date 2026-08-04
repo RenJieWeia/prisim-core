@@ -19,31 +19,42 @@ This library is designed to be imported by other services (HTTP APIs, CLI tools,
     - Rules are instantiated from config via `RuleFactory` (RANGE / MONOTONIC / RATE / STAGNATION).
   - **Chain of Responsibility**: `Sanitizer` runs a configurable chain of filters.
 - **Data Standardization**:
-  - **Precision Control**: `Unifier` converts floating-point readings to high-precision integer scaled values (e.g., kWh to micro-kWh) to eliminate floating-point arithmetic errors.
-  - **Time Alignment**: `Aligner` snaps readings to standard intervals (Snapshots).
+  - **Precision Control**: floating-point readings → high-precision `int64` scaled values (default ×10000), configurable via `WithPrecision(factor)`. Conversion uses **int64 truncation**.
+  - **Time Alignment**: `Aligner` (O(log n) binary search) snaps readings to standard intervals (Snapshots) within a configurable tolerance.
 - **Hexagonal Architecture**:
-  - **Domain**: Pure business logic (`pkg/core/domain`), standard interfaces (`CleaningRule`, `Sanitizer`, `Unifier`).
-  - **Ports**: Inbound (API/Ingestors) and Outbound (Repositories/Databases) definitions.
-  - **Services**: Orchestration layer gluing domain logic to ports (`pkg/core/services`).
+  - **Domain**: Pure business logic & entities (`pkg/core/domain`) — `Reading`, `StandardReading`, `Aligner`, `IngestContext`.
+  - **Ports**: Interface definitions (`pkg/core/ports`) — `CleaningRule`, `Sanitizer`, `EnergyDataStandardizer`, repositories, `CleaningRuleFactory`.
+  - **Services**: Orchestration layer (`pkg/core/services`) — `CoreStandardizer`, `ChainSanitizer`, built-in rules.
+  - **Adapters**: Infrastructure (`pkg/adapters`) — JSON/CSV ingestors, `RuleFactory`.
+
+## 🎬 快速体验 (Demo)
+
+无需编写代码即可感受完整流水线 (接入 → 清洗 → 标准化 → 查询)：
+
+```bash
+go run ./cmd/demo              # 脚本化演示 (内置脏数据样例)
+go run ./cmd/demo -ingest data.json   # 自喂数据 (.json / .csv)
+```
 
 ## 📂 Project Structure
 
 ```
 prism-core/
+├── cmd/
+│   └── demo/           # Demo program (go run ./cmd/demo)
+├── docs/
+│   └── dev-guide/      # Developer handbook (hexagonal architecture)
 ├── pkg/
+│   ├── adapters/       # Infrastructure layer
+│   │   ├── factory/    #   RuleFactory (rule instantiation)
+│   │   └── ingest/     #   JSON / CSV ingestors
 │   └── core/
-│       ├── domain/        # Pure Business Logic (Entities & Rules)
-│       │   ├── aligner.go
-│       │   ├── sanitizer.go
-│       │   ├── unifier.go
-│       │   └── rules.go
-│       ├── ports/         # Interface Definitions (Driver/Driven)
-│       └── services/      # Application Services (Orchestration)
-├── tests/                 # External Integration Tests
-│   ├── core/
-│   │   ├── domain/
-│   │   └── services/
-└── testdata/              # Sample data for tests
+│       ├── domain/     # Pure business logic (entities & algorithms)
+│       ├── ports/      # Interface definitions (driver / driven ports)
+│       └── services/   # Application services (orchestration + built-in rules)
+│           └── rules/  #   Range / Monotonic / Rate / Stagnation
+├── tests/              # External tests (packages are xxx_test)
+└── testdata/           # Test sample data
 ```
 
 ## 🚀 Getting Started
@@ -62,33 +73,52 @@ package main
 import (
     "context"
     "fmt"
+    "strings"
+    "time"
 
     // Import from the public package path
     "github.com/renjie/prism-core/pkg/adapters/ingest"
-    "github.com/renjie/prism-core/pkg/core/services"
     "github.com/renjie/prism-core/pkg/core/domain"
+    "github.com/renjie/prism-core/pkg/core/services"
 )
 
 func main() {
-    // 1. Setup Ingestion
-    ingestor := ingest.NewJsonUniversalIngestor(func(ctx context.Context, readings []domain.Reading) error {
-        fmt.Printf("Received batch of %d readings\n", len(readings))
-        return nil
-    })
-    
-    // 2. Setup Standardization Service
-    // Configure with 15-minute alignment and 4-decimal precision
+    // 1. Setup Standardization Service
+    // 15-minute alignment, 4-decimal precision (x10000)
     standardizer := services.NewCoreStandardizer(
-        services.WithAlignment(15*time.Minute, 1*time.Minute),
+        services.WithAlignment(15*time.Minute, 5*time.Minute),
         services.WithPrecision(10000),
     )
+
+    // 2. Process raw readings -> standardized grid output
+    ctx := context.Background()
+    raw := []domain.Reading{
+        {DeviceInfo: domain.DeviceInfo{ID: "D1", Type: domain.DeviceTypeElec},
+         Timestamp: time.Now().Truncate(15 * time.Minute), Value: 100.0},
+        {DeviceInfo: domain.DeviceInfo{ID: "D1", Type: domain.DeviceTypeElec},
+         Timestamp: time.Now().Truncate(15 * time.Minute).Add(15 * time.Minute), Value: 105.0},
+    }
+    results, err := standardizer.ProcessAndStandardize(ctx, raw)
+    if err != nil {
+        panic(err)
+    }
+    for _, r := range results {
+        fmt.Printf("%s ValueScaled=%d x%d\n", r.DeviceID, r.ValueScaled, r.ScaleFactor)
+    }
+
+    // 3. Or ingest from a stream (JSON array/object) via the universal ingestor
+    ing := ingest.NewJsonUniversalIngestor(func(ctx context.Context, rs []domain.Reading) error {
+        _, err := standardizer.ProcessAndStandardize(ctx, rs)
+        return err
+    })
+    ing.IngestStream(ctx, strings.NewReader(`[{"device_id":"D1","timestamp":"2026-01-01T10:00:00Z","value":100}]`))
 }
 ```
 
 ### Running Tests
 
 ```bash
-go test ./tests/...
+go test ./...
 ```
 
 ## 🛠 Architecture
@@ -118,6 +148,8 @@ svc := services.NewCoreStandardizer(services.WithCleaningRules(&MaxLimitRule{100
 For **dynamic rule loading** (rules configured per device type in a repository), you must inject both a rule repository and a rule factory:
 
 ```go
+import "github.com/renjie/prism-core/pkg/adapters/factory" // concrete factory (infrastructure layer)
+
 svc := services.NewCoreStandardizer(
     services.WithRuleRepository(ruleRepo),   // ports.CleaningRuleRepository
     services.WithRuleFactory(factory.GetRuleFactory()), // ports.CleaningRuleFactory

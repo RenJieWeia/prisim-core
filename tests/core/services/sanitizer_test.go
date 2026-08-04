@@ -68,3 +68,25 @@ func TestChainSanitizerEmpty(t *testing.T) {
 		t.Errorf("expected nil results for empty input, got %v / %v", clean, quarantined)
 	}
 }
+
+func TestChainSanitizerCrossDeviceIsolation(t *testing.T) {
+	// 回归: 规则上下文 (Previous) 只应在同一设备内传递，跨设备不得互相污染
+	base, _ := time.Parse(time.RFC3339, "2023-01-01T10:00:00Z")
+	sanitizer := services.NewSanitizer(&rules.MonotonicRule{Action: domain.ActionReject})
+
+	readings := []domain.Reading{
+		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
+		{DeviceInfo: domain.DeviceInfo{ID: "D2"}, Timestamp: base.Add(1 * time.Minute), Value: 50},  // D2 首条, 不应与 D1=100 比较
+		{DeviceInfo: domain.DeviceInfo{ID: "D2"}, Timestamp: base.Add(2 * time.Minute), Value: 60},  // D2 内递增
+		{DeviceInfo: domain.DeviceInfo{ID: "D2"}, Timestamp: base.Add(3 * time.Minute), Value: 40},  // D2 内回退 -> 拒绝
+		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base.Add(4 * time.Minute), Value: 120}, // D1 内递增 (>=100)
+	}
+
+	clean, quarantined := sanitizer.Clean(readings)
+	if len(clean) != 4 {
+		t.Fatalf("expected 4 clean readings, got %d: %+v", len(clean), clean)
+	}
+	if len(quarantined) != 1 || quarantined[0].Reading.DeviceInfo.ID != "D2" {
+		t.Fatalf("expected only D2 regression quarantined, got %+v", quarantined)
+	}
+}
