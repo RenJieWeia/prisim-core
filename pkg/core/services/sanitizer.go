@@ -208,11 +208,21 @@ func (s *ChainSanitizer) executeRule(ctx context.Context, rule any, curr domain.
 func (s *ChainSanitizer) executeReferenceRule(ctx context.Context, rr ports.ReferenceCleaningRule, curr domain.Reading, prev *domain.Reading, resolver *ReferenceResolver) (domain.RuleEvaluation, domain.Reading, ruleVerdict, error) {
 	specs := rr.ReferenceSpecs()
 
-	// 收集规则声明的参考对象 ID (用于评估记录)
+	refs := make(map[string]domain.ReferenceValue, len(specs))
 	refIDs := make([]string, 0, len(specs))
 	requests := make([]domain.ReferenceRequest, 0, len(specs))
 	for _, spec := range specs {
 		refIDs = append(refIDs, spec.ID)
+
+		// 当前批次 + 同设备 + 上一条: 直接使用清洗器维护的本设备上一条有效数据，
+		// 不得从包含被拒绝数据的原始批次中选择 PREVIOUS。
+		if spec.Source == domain.ReferenceSourceCurrentBatch &&
+			spec.Binding == domain.ReferenceBindingSameDevice &&
+			spec.Time.Mode == domain.ReferenceTimePrevious {
+			refs[spec.ID] = prevReferenceValue(prev)
+			continue
+		}
+
 		req, ok := buildReferenceRequest(spec, curr)
 		if !ok {
 			continue
@@ -220,9 +230,14 @@ func (s *ChainSanitizer) executeReferenceRule(ctx context.Context, rr ports.Refe
 		requests = append(requests, req)
 	}
 
-	refs, err := resolver.Resolve(ctx, requests)
-	if err != nil {
-		return domain.RuleEvaluation{}, curr, verdictFail, err
+	if len(requests) > 0 {
+		resolved, err := resolver.Resolve(ctx, requests)
+		if err != nil {
+			return domain.RuleEvaluation{}, curr, verdictFail, err
+		}
+		for id, v := range resolved {
+			refs[id] = v
+		}
 	}
 
 	// 缺失参考对象处理
@@ -275,6 +290,18 @@ func (s *ChainSanitizer) executeReferenceRule(ctx context.Context, rr ports.Refe
 		return eval, curr, verdictFail, nil
 	}
 	return eval, result.Reading, verdictPass, nil
+}
+
+// prevReferenceValue 将清洗器维护的"本设备上一条有效数据"转换为参考值
+func prevReferenceValue(prev *domain.Reading) domain.ReferenceValue {
+	if prev == nil {
+		return domain.ReferenceValue{}
+	}
+	return domain.ReferenceValue{
+		Found:     true,
+		Timestamp: prev.Timestamp,
+		Value:     prev.Value,
+	}
 }
 
 // outcomeFromCheckResult 将 CheckResult 映射为评估结果类型

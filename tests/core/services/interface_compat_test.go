@@ -28,9 +28,15 @@ func TestLegacyInterfacesStillWork(t *testing.T) {
 		t.Fatalf("expected empty results, got %v / %v", clean, quarantined)
 	}
 
-	// 仅使用旧接口的标准化调用方式 (NewCoreStandardizer 返回值可赋值给旧接口)
+	// 仅使用旧接口的标准化调用方式 (NewCoreStandardizer 返回 ports.EnergyDataStandardizer)
 	var std ports.EnergyDataStandardizer = services.NewCoreStandardizer()
 	if _, err := std.ProcessAndStandardize(context.Background(), nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// NewEnergyDataProcessor 返回支持 Process 的完整接口
+	var proc ports.EnergyDataProcessor = services.NewEnergyDataProcessor()
+	if _, err := proc.Process(context.Background(), nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

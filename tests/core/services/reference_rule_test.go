@@ -10,6 +10,7 @@ import (
 	"github.com/renjie/prism-core/pkg/core/domain"
 	"github.com/renjie/prism-core/pkg/core/ports"
 	"github.com/renjie/prism-core/pkg/core/services"
+	"github.com/renjie/prism-core/pkg/core/services/rules"
 )
 
 // referenceCompareRule 测试用参考规则: 当前值 与 参考值 比较
@@ -259,7 +260,7 @@ func TestReferenceQueryDedup(t *testing.T) {
 		ID:            "shared",
 		Source:        domain.ReferenceSourceStandardRepo,
 		Binding:       domain.ReferenceBindingSameDevice,
-		Time:          domain.ReferenceTimeSelector{Mode: domain.ReferenceTimeRelative, Offset: 72 * time.Hour},
+		Time:          domain.ReferenceTimeSelector{Mode: domain.ReferenceTimeRelative, Offset: 72 * time.Hour, Tolerance: time.Minute},
 		MissingPolicy: domain.MissingReferenceSkip,
 	}
 	rule1 := &referenceCompareRule{id: "r1", specs: []domain.ReferenceSpec{sharedSpec}, op: "ge"}
@@ -290,6 +291,57 @@ func TestReferenceQueryDedup(t *testing.T) {
 	}
 	if passCount != 2 {
 		t.Errorf("expected 2 PASS evaluations (r1, r2), got %d", passCount)
+	}
+}
+
+// TestPreviousReferenceDoesNotUseRejectedReading CURRENT_BATCH PREVIOUS 必须使用同设备
+// 已通过规则链的有效数据，不得从包含被拒绝数据的原始批次中选择 PREVIOUS。
+// 场景: D1 10:00=100(通过) / 10:15=90(被 Range 规则拒绝) / 10:30=95。
+// PREVIOUS 应指向有效值 100 (而非被拒绝的 90)，因此 95 < 100 被参考规则拒绝;
+// 若错误地使用原始批次的上一条 (90)，则 95 >= 90 会误通过。
+func TestPreviousReferenceDoesNotUseRejectedReading(t *testing.T) {
+	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
+
+	// 先拒绝中间读数 90 的旧规则，与参考规则组合 (由 CoreStandardizer 内部适配器混合)
+	rejectMid := &rules.RangeRule{Min: 93, Max: 200, Action: domain.ActionReject}
+	refRule := &referenceCompareRule{
+		id:    "prev-ge",
+		specs: []domain.ReferenceSpec{previousSpec(domain.MissingReferenceSkip)},
+		op:    "ge",
+	}
+	std := services.NewEnergyDataProcessor(
+		services.WithCleaningRules(rejectMid),
+		services.WithReferenceRules(refRule),
+	)
+
+	readings := []domain.Reading{
+		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
+		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base.Add(15 * time.Minute), Value: 90},
+		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base.Add(30 * time.Minute), Value: 95},
+	}
+
+	result, err := std.Process(context.Background(), readings)
+	if err != nil {
+		t.Fatalf("process failed: %v", err)
+	}
+
+	// 10:30 的 PREVIOUS 必须是有效值 100 -> 95 < 100 被拒绝
+	var rejected30 bool
+	for _, ev := range result.Evaluations {
+		if ev.RuleID == "prev-ge" && ev.Outcome == string(domain.RuleOutcomeReject) {
+			rejected30 = true
+		}
+	}
+	if !rejected30 {
+		t.Fatalf("expected 10:30 reading rejected against valid previous 100, got evaluations %+v", result.Evaluations)
+	}
+	// 10:15 的 90 被 Range 规则拒绝 + 10:30 的 95 被参考规则拒绝 -> 隔离 2 条
+	if len(result.Rejected) != 2 {
+		t.Fatalf("expected 2 rejected (90 by Range, 95 by ref rule), got %d: %+v", len(result.Rejected), result.Rejected)
+	}
+	// 仅 10:00 通过
+	if len(result.Accepted) != 1 {
+		t.Fatalf("expected only 10:00 accepted, got %+v", result.Accepted)
 	}
 }
 

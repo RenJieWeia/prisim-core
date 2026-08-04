@@ -45,12 +45,11 @@ type Sanitizer interface {
 	Clean(readings []domain.Reading) (clean []domain.Reading, quarantined []domain.QuarantineReading)
 }
 
-// ReferenceSanitizer 支持参考对象的清洗器接口 (Sanitizer 的扩展)
-// Clean 由 Sanitizer 继承，仅适用于旧规则；含参考规则时必须使用
-// CleanWithReferences，否则参考源配置错误会被吞掉。
+// ReferenceSanitizer 支持参考对象的清洗器接口
+// 不嵌入 Sanitizer，因此不会暴露会吞掉错误的 Clean()。
+// ChainSanitizer 可同时实现 Sanitizer 与 ReferenceSanitizer；
+// 含参考规则的清洗器必须通过本接口调用 CleanWithReferences。
 type ReferenceSanitizer interface {
-	Sanitizer
-
 	// CleanWithReferences 带参考数据源的清洗逻辑
 	// repoRefs 为历史仓储参考源 (可为 nil，此时 STANDARD_REPO 类型的参考请求会报错)。
 	// 返回包含规则评估记录的完整清洗结果。

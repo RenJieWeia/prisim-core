@@ -57,7 +57,7 @@ func rawReading(deviceID string, ts time.Time, v float64) domain.Reading {
 func TestPersistenceConflictWithRepositoryAndSink(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	repo := &persistRecorder{}
-	std := services.NewCoreStandardizer(
+	std := services.NewEnergyDataProcessor(
 		services.WithRepository(repo),
 		services.WithResultSinks(sink.NewRepositorySink(repo, ports.UpsertStrategyHighPriorityWins)),
 	)
@@ -82,7 +82,7 @@ func TestPersistenceConflictWithRepositoryAndSink(t *testing.T) {
 func TestPersistenceConflictTwoRepositorySinks(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	repo := &persistRecorder{}
-	std := services.NewCoreStandardizer(
+	std := services.NewEnergyDataProcessor(
 		services.WithResultSinks(
 			sink.NewRepositorySink(repo, ports.UpsertStrategyHighPriorityWins),
 			sink.NewRepositorySink(repo, ports.UpsertStrategyLastWriteWins),
@@ -104,7 +104,7 @@ func TestPersistenceConflictTwoRepositorySinks(t *testing.T) {
 func TestWithRepositoryPersistsOnce(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	repo := &persistRecorder{}
-	std := services.NewCoreStandardizer(services.WithRepository(repo))
+	std := services.NewEnergyDataProcessor(services.WithRepository(repo))
 
 	result, err := std.Process(context.Background(), []domain.Reading{
 		rawReading("D1", base, 100),
@@ -125,7 +125,7 @@ func TestWithRepositoryPersistsOnce(t *testing.T) {
 func TestRepositorySinkPersistsOnce(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	repo := &persistRecorder{}
-	std := services.NewCoreStandardizer(
+	std := services.NewEnergyDataProcessor(
 		services.WithResultSinks(sink.NewRepositorySink(repo, ports.UpsertStrategyHighPriorityWins)),
 	)
 

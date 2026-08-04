@@ -119,9 +119,8 @@ func WithConcurrencyLimit(limit int) StandardizerOption {
 	}
 }
 
-// NewCoreStandardizer 初始化标准化服务
-// 使用 Functional Options 模式进行配置
-func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataProcessor {
+// newCoreStandardizer 内部构造函数，返回具体实现
+func newCoreStandardizer(opts ...StandardizerOption) *CoreStandardizer {
 	// 默认配置
 	s := &CoreStandardizer{
 		sanitizer:        newChainSanitizer(nil, nil),    // 默认无规则
@@ -143,6 +142,18 @@ func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataProcessor {
 	}
 
 	return s
+}
+
+// NewCoreStandardizer 初始化标准化服务 (旧接口)
+// 使用 Functional Options 模式进行配置
+func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataStandardizer {
+	return newCoreStandardizer(opts...)
+}
+
+// NewEnergyDataProcessor 初始化标准化服务 (完整处理接口)
+// 与 NewCoreStandardizer 复用同一内部构造函数，返回支持 Process 的接口。
+func NewEnergyDataProcessor(opts ...StandardizerOption) ports.EnergyDataProcessor {
+	return newCoreStandardizer(opts...)
 }
 
 // GetStandardReading 获取特定时间点的标准读数

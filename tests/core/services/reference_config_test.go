@@ -28,7 +28,7 @@ func standardRepoSrcSpec() domain.ReferenceSpec {
 		ID:            "repo-src",
 		Source:        domain.ReferenceSourceStandardRepo,
 		Binding:       domain.ReferenceBindingSameDevice,
-		Time:          domain.ReferenceTimeSelector{Mode: domain.ReferenceTimeRelative, Offset: 72 * time.Hour},
+		Time:          domain.ReferenceTimeSelector{Mode: domain.ReferenceTimeRelative, Offset: 72 * time.Hour, Tolerance: time.Minute},
 		MissingPolicy: domain.MissingReferenceSkip,
 	}
 }
@@ -57,7 +57,7 @@ func TestReferenceRuleMissingSourceConfigError(t *testing.T) {
 func TestProcessReferenceRuleMissingSourceConfigError(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	rule := &referenceCompareRule{id: "needs-repo", specs: []domain.ReferenceSpec{standardRepoSrcSpec()}, op: "ge"}
-	std := services.NewCoreStandardizer(services.WithReferenceRules(rule))
+	std := services.NewEnergyDataProcessor(services.WithReferenceRules(rule))
 
 	_, err := std.Process(context.Background(), []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
@@ -91,7 +91,7 @@ func TestReferenceRuleNegativeOffsetConfigError(t *testing.T) {
 func TestProcessReferenceRuleNegativeOffsetConfigError(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	rule := &referenceCompareRule{id: "neg-offset", specs: []domain.ReferenceSpec{negativeOffsetSpec()}, op: "ge"}
-	std := services.NewCoreStandardizer(services.WithReferenceRules(rule))
+	std := services.NewEnergyDataProcessor(services.WithReferenceRules(rule))
 
 	_, err := std.Process(context.Background(), []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
@@ -115,7 +115,7 @@ func TestProcessReferenceRuleWithSourceWorks(t *testing.T) {
 	src := reference.NewRepositoryReferenceSource(repo, time.Minute)
 
 	rule := &referenceCompareRule{id: "needs-repo", specs: []domain.ReferenceSpec{standardRepoSrcSpec()}, op: "ge"}
-	std := services.NewCoreStandardizer(
+	std := services.NewEnergyDataProcessor(
 		services.WithReferenceRules(rule),
 		services.WithReferenceSource(src),
 	)

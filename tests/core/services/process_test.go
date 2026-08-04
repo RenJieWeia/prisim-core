@@ -13,7 +13,7 @@ import (
 // TestProcessReturnsFullResult 验证 Process 返回完整处理结果
 func TestProcessReturnsFullResult(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
-	std := services.NewCoreStandardizer(
+	std := services.NewEnergyDataProcessor(
 		services.WithAlignment(15*time.Minute, 5*time.Minute),
 		services.WithCleaningRules(&rules.MonotonicRule{Action: domain.ActionReject}),
 	)
@@ -58,7 +58,7 @@ func TestProcessReturnsFullResult(t *testing.T) {
 // TestProcessAndStandardizeCompatibility 向后兼容: 原方法只返回 Accepted
 func TestProcessAndStandardizeCompatibility(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
-	std := services.NewCoreStandardizer(
+	std := services.NewEnergyDataProcessor(
 		services.WithCleaningRules(&rules.MonotonicRule{Action: domain.ActionReject}),
 	)
 
@@ -87,7 +87,7 @@ func TestProcessAndStandardizeCompatibility(t *testing.T) {
 
 // TestProcessEmptyInput 空输入不应报错
 func TestProcessEmptyInput(t *testing.T) {
-	std := services.NewCoreStandardizer()
+	std := services.NewEnergyDataProcessor()
 	result, err := std.Process(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Process failed: %v", err)

@@ -147,7 +147,7 @@ func TestCoreStandardizerDeliversToSinks(t *testing.T) {
 		return nil
 	})
 
-	std := services.NewCoreStandardizer(services.WithResultSinks(ms, cb))
+	std := services.NewEnergyDataProcessor(services.WithResultSinks(ms, cb))
 	raw := []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base.Add(15 * time.Minute), Value: 90},
@@ -175,7 +175,7 @@ func TestSinkErrorPropagates(t *testing.T) {
 		return errors.New("boom")
 	})
 
-	std := services.NewCoreStandardizer(services.WithResultSinks(bad))
+	std := services.NewEnergyDataProcessor(services.WithResultSinks(bad))
 	raw := []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
 	}
@@ -207,7 +207,7 @@ func TestSinkPartialFailureDeliversAll(t *testing.T) {
 		return errors.New("second boom")
 	})
 
-	std := services.NewCoreStandardizer(services.WithResultSinks(good, bad1, bad2))
+	std := services.NewEnergyDataProcessor(services.WithResultSinks(good, bad1, bad2))
 	raw := []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
 	}
