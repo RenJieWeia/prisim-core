@@ -1,6 +1,10 @@
 package ports
 
-import "github.com/renjie/prism-core/pkg/core/domain"
+import (
+	"context"
+
+	"github.com/renjie/prism-core/pkg/core/domain"
+)
 
 // CleaningContext 清洗规则执行时的上下文信息
 type CleaningContext struct {
@@ -24,6 +28,13 @@ type CleaningRule interface {
 	Check(ctx CleaningContext, curr domain.Reading) CheckResult
 }
 
+// CleanResult 清洗结果 (含规则评估记录)
+type CleanResult struct {
+	Clean       []domain.Reading
+	Quarantined []domain.QuarantineReading
+	Evaluations []domain.RuleEvaluation
+}
+
 // Sanitizer 数据清洗器接口
 // 负责协调多个清洗规则的执行
 type Sanitizer interface {
@@ -32,4 +43,9 @@ type Sanitizer interface {
 	// 2. quarantined: 违反规则被拒绝的次品数据 (包含拒绝原因)
 	// 注意: 返回的 clean 数据已按时间戳升序排列
 	Clean(readings []domain.Reading) (clean []domain.Reading, quarantined []domain.QuarantineReading)
+
+	// CleanWithReferences 带参考数据源的清洗逻辑
+	// repoRefs 为历史仓储参考源 (可为 nil，此时 STANDARD_REPO 类型的参考请求会报错)。
+	// 返回包含规则评估记录的完整清洗结果。
+	CleanWithReferences(ctx context.Context, readings []domain.Reading, repoRefs ReferenceSource) (CleanResult, error)
 }

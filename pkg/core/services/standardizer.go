@@ -25,6 +25,12 @@ type CoreStandardizer struct {
 	ruleRepo         ports.CleaningRuleRepository    // 可选规则持久层
 	ruleFactory      ports.CleaningRuleFactory       // 可选规则工厂 (动态清洗依赖)
 	quarantineRepo   ports.QuarantineRepository      // 可选隔离区持久层 (for Bad Data)
+
+	// 参考对象与下游输出 (本轮新增)
+	cleaningRules   []ports.CleaningRule  // 静态配置的旧规则 (WithCleaningRules)
+	referenceRules  []any                 // 静态配置的参考规则 (WithReferenceRules)
+	referenceSource ports.ReferenceSource // 历史仓储参考源 (可选)
+	resultSinks     []ports.ResultSink    // 下游输出端口
 }
 
 // StandardizerOption 定义配置选项函数 (Functional Option Pattern)
@@ -76,10 +82,31 @@ func WithRepository(repo ports.StandardReadingRepository) StandardizerOption {
 	}
 }
 
-// WithCleaningRules 设置清洗规则
+// WithCleaningRules 设置清洗规则 (旧规则接口)
 func WithCleaningRules(rules ...ports.CleaningRule) StandardizerOption {
 	return func(s *CoreStandardizer) {
-		s.sanitizer = NewSanitizer(rules...)
+		s.cleaningRules = append(s.cleaningRules, rules...)
+	}
+}
+
+// WithReferenceRules 设置参考规则 (参考规则接口，可混合旧规则)
+func WithReferenceRules(rules ...any) StandardizerOption {
+	return func(s *CoreStandardizer) {
+		s.referenceRules = append(s.referenceRules, rules...)
+	}
+}
+
+// WithReferenceSource 设置历史仓储参考源 (用于参考对象的 STANDARD_REPO 来源)
+func WithReferenceSource(src ports.ReferenceSource) StandardizerOption {
+	return func(s *CoreStandardizer) {
+		s.referenceSource = src
+	}
+}
+
+// WithResultSinks 设置下游输出端口 (处理结果投递)
+func WithResultSinks(sinks ...ports.ResultSink) StandardizerOption {
+	return func(s *CoreStandardizer) {
+		s.resultSinks = append(s.resultSinks, sinks...)
 	}
 }
 
@@ -110,6 +137,16 @@ func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataStandardize
 		opt(s)
 	}
 
+	// 选项应用完毕后统一构建清洗器 (允许旧规则与参考规则混合)
+	if len(s.cleaningRules) > 0 || len(s.referenceRules) > 0 {
+		all := make([]any, 0, len(s.cleaningRules)+len(s.referenceRules))
+		for _, r := range s.cleaningRules {
+			all = append(all, r)
+		}
+		all = append(all, s.referenceRules...)
+		s.sanitizer = NewSanitizerWithReferences(all...)
+	}
+
 	return s
 }
 
@@ -124,11 +161,25 @@ func (s *CoreStandardizer) GetStandardReading(ctx context.Context, deviceID stri
 }
 
 func (s *CoreStandardizer) ProcessAndStandardize(ctx context.Context, rawReadings []domain.Reading) ([]domain.StandardReading, error) {
+	result, err := s.Process(ctx, rawReadings)
+	if err != nil {
+		return nil, err
+	}
+	return result.Accepted, nil
+}
+
+// Process 完整处理流程:
+//  1. 数据清洗 (旧规则 / 参考规则，记录规则评估)
+//  2. 异常数据写入隔离区 (异步)
+//  3. 标准数据并发标准化与持久化
+//  4. 处理结果投递到下游输出端口
+func (s *CoreStandardizer) Process(ctx context.Context, rawReadings []domain.Reading) (domain.ProcessingResult, error) {
 	// Step 1: A. 数据清洗 (替别人做“脏活累活”)
 	// 剔除空值、负值、重复值和异常跳变
 	// 这一步是批量操作，因为清洗依赖上下文（如前后值的跳变）
 	var cleanReadings []domain.Reading
 	var quarantinedReadings []domain.QuarantineReading
+	var evaluations []domain.RuleEvaluation
 
 	if s.ruleRepo != nil {
 		// 动态加载规则清洗
@@ -137,11 +188,17 @@ func (s *CoreStandardizer) ProcessAndStandardize(ctx context.Context, rawReading
 		if err != nil {
 			// Fallback or error? For now log and return partial?
 			// To be safe, return error
-			return nil, fmt.Errorf("dynamic cleaning failed: %w", err)
+			return domain.ProcessingResult{}, fmt.Errorf("dynamic cleaning failed: %w", err)
 		}
 	} else {
-		// 使用默认规则清洗
-		cleanReadings, quarantinedReadings = s.sanitizer.Clean(rawReadings)
+		// 使用默认规则清洗 (支持参考规则)
+		cleanRes, err := s.sanitizer.CleanWithReferences(ctx, rawReadings, s.referenceSource)
+		if err != nil {
+			return domain.ProcessingResult{}, fmt.Errorf("cleaning failed: %w", err)
+		}
+		cleanReadings = cleanRes.Clean
+		quarantinedReadings = cleanRes.Quarantined
+		evaluations = cleanRes.Evaluations
 	}
 
 	// 异步保存隔离区数据 (以免阻塞主流程)
@@ -243,18 +300,31 @@ func (s *CoreStandardizer) ProcessAndStandardize(ctx context.Context, rawReading
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
+		return domain.ProcessingResult{}, errors.Join(errs...)
 	}
 
 	// Step 3: Persistence (if configured)
 	if s.repo != nil && len(standards) > 0 {
 		// Use Priority-based upsert strategy to respect data governance rules
 		if err := s.repo.SaveBatch(ctx, standards, ports.UpsertStrategyHighPriorityWins); err != nil {
-			return nil, fmt.Errorf("failed to persist standards: %w", err)
+			return domain.ProcessingResult{}, fmt.Errorf("failed to persist standards: %w", err)
 		}
 	}
 
-	return standards, nil
+	result := domain.ProcessingResult{
+		Accepted:    standards,
+		Rejected:    quarantinedReadings,
+		Evaluations: evaluations,
+	}
+
+	// Step 4: 投递处理结果到下游输出端口
+	for _, sink := range s.resultSinks {
+		if err := sink.Deliver(ctx, result); err != nil {
+			return result, fmt.Errorf("sink %s deliver failed: %w", sink.ID(), err)
+		}
+	}
+
+	return result, nil
 }
 
 // DefaultScaleFactor 默认精度因子 (支持4位小数精度)

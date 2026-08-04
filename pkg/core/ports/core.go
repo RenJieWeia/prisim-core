@@ -32,6 +32,10 @@ type EnergyDataStandardizer interface {
 
 	// ProcessAndStandardize 直接处理输入数据并返回标准集 (用于即时转换场景)
 	ProcessAndStandardize(ctx context.Context, rawReadings []domain.Reading) ([]domain.StandardReading, error)
+
+	// Process 完整处理输入数据并返回完整处理结果 (含接受/拒绝/规则评估)
+	// ProcessAndStandardize 是其简化版，只返回 Accepted。
+	Process(ctx context.Context, rawReadings []domain.Reading) (domain.ProcessingResult, error)
 }
 
 // Aligner 定义时间对齐能力的接口
