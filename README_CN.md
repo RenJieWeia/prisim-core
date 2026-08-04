@@ -21,13 +21,17 @@
 - **数据标准化 (Standardization)**:
   - **精度统一**: 将浮点数转换为高精度的整型定点数 (Scaled Integer)，默认 10000 倍精度 (4 位小数)，可通过 `WithPrecision(factor)` 配置；转换采用 **int64 截断**。
   - **时间对齐 (Aligner)**: 使用**二分查找算法** O(log n) 将散乱的时间点对齐到标准的整点快照。
+- **参考对象 (Reference Objects)** (v1.1+): 规则可比较"当前数据 vs 参考数据"——同一设备的**上一条有效值**、**相对时间点**数据（如三天前，以当前读数自身 `Timestamp` 为基准，绝不用 `time.Now()`）、或**时间窗口**聚合数据（`AVG`/`SUM`/`MIN`/`MAX`/`LATEST`/`DELTA`）。参考缺失按策略处理：`SKIP_RULE` / `REJECT` / `QUARANTINE`。
+- **完整处理结果 (Full Processing Result)** (v1.1+): `NewEnergyDataProcessor` 提供的 `Process` 返回 `ProcessingResult{Accepted, Rejected, Evaluations}`，含每条规则的评估记录（`PASS`/`REJECT`/`SKIP`/`CORRECT`/`QUARANTINE`）、使用的参考对象 ID 与原因。
+- **下游输出 (Downstream Output)** (v1.1+): 可插拔的 `ResultSink`（`MemorySink` / `CallbackSink` / `RepositorySink`）在每次处理后接收完整结果；多个 Sink 失败时错误聚合返回，绝不静默丢弃。
+- **多设备状态隔离**: 有状态规则按**设备**分别维护"上一条有效数据"，交错的多设备数据互不污染，且不原地修改调用方传入的数据切片。
 - **并发安全**:
   - 异步操作带有超时控制和错误日志。
   - 使用 `errors.Join()` 聚合并发错误。
 - **架构设计**:
-  - **Domain (领域层)**: 核心业务实体与接口定义 (`pkg/core/domain`)。
-  - **Services (服务层)**: 业务流程编排 (`pkg/core/services`)，包含 Sanitizer 与 Standardizer 实现。
-  - **Adapters (适配层)**: 外部交互实现 (`pkg/adapters`)，包含 Ingestors 和 Factory。
+  - **Domain (领域层)**: 核心业务实体与接口定义 (`pkg/core/domain`)，含 `ReferenceSpec`、`ProcessingResult` 等。
+  - **Services (服务层)**: 业务流程编排 (`pkg/core/services`)，包含 Sanitizer 与 Standardizer 实现、`BatchReferenceSource`/`ReferenceResolver`。
+  - **Adapters (适配层)**: 外部交互实现 (`pkg/adapters`)，包含 Ingestors、Factory、`RepositoryReferenceSource` 与 ResultSinks。
 
 ## 🎬 快速体验 (Demo)
 
@@ -48,21 +52,26 @@ prism-core/
 │   └── dev-guide/     # 开发手册 (六边形架构说明)
 ├── pkg/
 │   ├── adapters/      # 适配器层 (外部交互)
-│   │   ├── factory/   #   规则工厂 (RuleFactory 规则实例化)
-│   │   └── ingest/    #   数据摄入实现 (CSV, JSON)
+│   │   ├── factory/    #   规则工厂 (RuleFactory 规则实例化)
+│   │   ├── ingest/     #   数据摄入实现 (CSV, JSON)
+│   │   ├── reference/  #   仓储参考源 (RepositoryReferenceSource)
+│   │   └── sink/       #   结果输出端口 (Memory / Callback / Repository)
 │   └── core/
 │       ├── domain/    # 核心业务逻辑 (实体 & 算法)
 │       │   ├── aligner.go    # 时间对齐逻辑
 │       │   ├── unifier.go    # 精度转换器 (math.Round)
 │       │   ├── rule.go       # 规则定义 (RuleType / RuleAction)
+│       │   ├── reference.go  # 参考对象 (ReferenceSpec / Request / Value)
+│       │   ├── result.go     # 处理结果 (ProcessingResult / RuleEvaluation)
 │       │   └── ...
 │       ├── ports/     # 接口定义 (驱动/被驱动端口)
 │       └── services/  # 应用服务 (流程编排)
 │           ├── sanitizer.go  # 清洗器 (责任链)
+│           ├── reference_source.go # 批次参考源与解析器 (Batch / Resolver)
 │           ├── rules/        # 内置规则: Range / Monotonic / Rate / Stagnation
 │           └── ...
 ├── tests/             # 外部集成测试 (包均为 xxx_test)
-│   ├── adapters/      # 工厂与接入器测试
+│   ├── adapters/      # 工厂、接入器、参考源与 Sink 测试
 │   └── core/          # 领域与服务层测试
 └── testdata/          # 测试用例样本数据
 ```
@@ -168,6 +177,8 @@ standardizer := services.NewCoreStandardizer(
 sr, err := standardizer.GetStandardReading(ctx, "D1", t)
 ```
 
+> 也可通过下游输出端口持久化：`sink.NewRepositorySink(repo, strategy)` 只保存 `Accepted` 数据。若 `WithRepository` 与 `RepositorySink` 指向同一仓储，会在处理前返回"重复持久化目标"配置错误。
+
 ### 5. 动态规则加载 (Dynamic Rules)
 
 按设备类型从仓储加载清洗规则时，需要同时注入规则仓储与规则工厂：
@@ -183,6 +194,71 @@ standardizer := services.NewCoreStandardizer(
 
 > 依赖倒置：核心层只依赖 `ports.CleaningRuleFactory` 接口，不直接依赖 `pkg/adapters`。
 
+### 6. 参考对象与完整处理结果 (Reference Objects & Full Processing)
+
+规则可比较"当前数据 vs 参考数据"。实现 `ports.ReferenceCleaningRule` 并通过 `domain.ReferenceSpec` 声明所需参考对象：
+
+```go
+import "github.com/renjie/prism-core/pkg/core/domain"
+
+// 示例: 同一设备三天前的值 (以当前读数 Timestamp 为基准, 不使用 time.Now())
+spec := domain.ReferenceSpec{
+    ID:      "d3",
+    Source:  domain.ReferenceSourceStandardRepo, // 或 ReferenceSourceCurrentBatch (当前批次)
+    Binding: domain.ReferenceBindingSameDevice,  // 或 EXPLICIT + DeviceID (指定设备)
+    Time:    domain.ReferenceTimeSelector{Mode: domain.ReferenceTimeRelative, Offset: 72 * time.Hour, Tolerance: time.Hour},
+    MissingPolicy: domain.MissingReferenceSkip,  // SKIP_RULE / REJECT / QUARANTINE
+}
+
+// 参考规则: 当前值必须 >= 参考值
+type RefGeRule struct{ Spec domain.ReferenceSpec }
+func (r *RefGeRule) RuleID() string { return "ref-ge" }
+func (r *RefGeRule) ReferenceSpecs() []domain.ReferenceSpec { return []domain.ReferenceSpec{r.Spec} }
+func (r *RefGeRule) CheckWithReferences(in domain.RuleInput) ports.CheckResult {
+    ref := in.References[r.Spec.ID]
+    if !ref.Found || in.Current.Value >= ref.Value {
+        return ports.CheckResult{Reading: in.Current, Passed: true}
+    }
+    return ports.CheckResult{Reading: in.Current, Passed: false, Reason: "below reference"}
+}
+```
+
+时间选择器支持三种模式：
+
+- `PREVIOUS`：同一设备**上一条有效值**（通过规则链的有效数据，跨设备隔离）。
+- `RELATIVE`：目标时间 = `当前时间 - Offset`（Offset 非负，向历史方向偏移）。
+- `WINDOW`：`[当前时间-Offset, 当前时间)` 内聚合，支持 `AVG`/`SUM`/`MIN`/`MAX`/`LATEST`/`DELTA`。
+
+注册参考规则、注入历史参考源并获取完整结果：
+
+```go
+import (
+    "github.com/renjie/prism-core/pkg/adapters/reference"
+    "github.com/renjie/prism-core/pkg/adapters/sink"
+    "github.com/renjie/prism-core/pkg/core/services"
+)
+
+// 完整处理接口 (含 Process); 仅标准化可用 NewCoreStandardizer
+std := services.NewEnergyDataProcessor(
+    services.WithReferenceRules(&RefGeRule{Spec: spec}),                     // ports.ReferenceCleaningRule
+    services.WithReferenceSource(reference.NewRepositoryReferenceSource(repo, time.Minute)), // STANDARD_REPO 历史参考源
+    services.WithResultSinks(sink.NewMemorySink()),                          // 可选下游输出
+)
+
+result, err := std.Process(ctx, rawReadings)
+// result.Accepted    []domain.StandardReading   通过并标准化的数据
+// result.Rejected    []domain.QuarantineReading 被拒绝/隔离的数据
+// result.Evaluations []domain.RuleEvaluation    规则评估 (RuleID / Outcome / Reason / ReferenceIDs)
+```
+
+要点：
+
+- `ReferenceSource` 是参考查询端口（`Resolve(ctx, requests)`），规则不得直接查库。内置实现：`BatchReferenceSource`（当前批次）与 `RepositoryReferenceSource`（历史 `StandardReadingRepository`），单次处理内有内存缓存去重。
+- 声明 `STANDARD_REPO` 参考对象但未配置参考源、或 `RELATIVE`/`WINDOW` 的 `Offset` 为负，都会在处理前返回明确配置错误——参考规则**绝不静默退化**。
+- `SKIP_RULE`/`REJECT`/`QUARANTINE` 仅在"确实查无参考数据"时触发。
+- `RepositorySink` 将 `Accepted` 写入 `StandardReadingRepository`；与 `WithRepository` 指向同一仓储时会报"重复持久化"配置错误。
+- 实现位于 `pkg/adapters/reference` 与 `pkg/adapters/sink`，`pkg/core` 不依赖任何适配器。
+
 ## 🛠 开发与测试
 
 本项目采用严格的测试分离策略，单元测试位于 `tests/` 目录下。
@@ -193,6 +269,9 @@ standardizer := services.NewCoreStandardizer(
 ```bash
 # 运行所有测试
 go test ./...
+go vet ./...
+# 竞态检测 (需要 gcc/clang, 即 CGO_ENABLED=1)
+CGO_ENABLED=1 go test -race ./...
 ```
 
 ## 📄 许可证
