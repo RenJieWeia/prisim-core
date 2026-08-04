@@ -39,6 +39,9 @@ func NewRuleFactory() *RuleFactory {
 	}
 	// Register built-in rules
 	f.Register(domain.RuleTypeRange, buildRangeRule)
+	f.Register(domain.RuleTypeMonotonic, buildMonotonicRule)
+	f.Register(domain.RuleTypeRate, buildRateRule)
+	f.Register(domain.RuleTypeStagnation, buildStagnationRule)
 	return f
 }
 
@@ -73,4 +76,32 @@ func buildRangeRule(params map[string]interface{}, action domain.RuleAction) (po
 		action = domain.ActionReject
 	}
 	return &rules.RangeRule{Min: min, Max: max, Action: action}, nil
+}
+
+// buildMonotonicRule (Built-in implementation)
+func buildMonotonicRule(params map[string]interface{}, action domain.RuleAction) (ports.CleaningRule, error) {
+	if action == "" {
+		action = domain.ActionReject
+	}
+	return &rules.MonotonicRule{Action: action}, nil
+}
+
+// buildRateRule (Built-in implementation)
+func buildRateRule(params map[string]interface{}, action domain.RuleAction) (ports.CleaningRule, error) {
+	maxRate, ok := params["max_rate_per_second"].(float64)
+	if !ok || maxRate <= 0 {
+		return nil, fmt.Errorf("invalid parameters for RATE rule: need max_rate_per_second(float) > 0")
+	}
+	if action == "" {
+		action = domain.ActionReject
+	}
+	return &rules.RateRule{MaxRatePerSecond: maxRate, Action: action}, nil
+}
+
+// buildStagnationRule (Built-in implementation)
+func buildStagnationRule(params map[string]interface{}, action domain.RuleAction) (ports.CleaningRule, error) {
+	if action == "" {
+		action = domain.ActionReject
+	}
+	return &rules.StagnationRule{Action: action}, nil
 }

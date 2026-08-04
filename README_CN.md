@@ -12,7 +12,10 @@
   - **策略模式 (Strategy Pattern)**: 清洗规则完全解耦，通过 `RuleFactory` 支持热插拔。
   - **内置规则库**:
     - `RangeRule`: 范围检查，支持 Min/Max 阈值校验与自动修正 (Clamping)。
-    - *可扩展*: 预定义了 `Rate` (变化率) 和 `Trend` (趋势) 规则类型接口，便于后续扩展。
+    - `MonotonicRule`: 单调性检查，防止累计读数回退。
+    - `RateRule`: 变化率检查，检测不可能出现的尖峰跳变。
+    - `StagnationRule`: 停滞检查，识别死传感器 (连续读数不变)。
+    - 规则均通过 `RuleFactory` 按类型实例化 (RANGE / MONOTONIC / RATE / STAGNATION)。
   - **责任链 (Chain of Responsibility)**: 通过 `Sanitizer` 服务串行执行配置的过滤器。
   - **结构化结果**: 规则返回 `CheckResult` 结构体，包含修正状态和原因说明。
 - **数据标准化 (Standardization)**:
@@ -66,6 +69,7 @@ go get github.com/renjie/prism-core
 import (
     "context"
     "os"
+    "github.com/renjie/prism-core/pkg/adapters/ingest"
     "github.com/renjie/prism-core/pkg/core/services"
     "github.com/renjie/prism-core/pkg/core/domain"
 )
@@ -79,7 +83,7 @@ downstreamHandler := func(ctx context.Context, readings []domain.Reading) error 
 }
 
 // 初始化摄入器
-ingestor := services.NewJsonUniversalIngestor(downstreamHandler)
+ingestor := ingest.NewJsonUniversalIngestor(downstreamHandler)
 
 // 打开数据源 (io.Reader)
 file, _ := os.Open("data.json")
@@ -140,29 +144,29 @@ for _, res := range results {
 
 ### 4. 数据持久化 (Persistence)
 
-项目提供了 SQLite 持久化适配器示例。
-
-**前置条件**: 需要安装 CGO 支持的 SQLite 驱动 (推荐 GCC 环境)。
-```bash
-go get github.com/mattn/go-sqlite3
-```
-
-**示例代码**: 参见 `cmd/example/sqlite_demo/main.go`
+`ProcessAndStandardize` 支持可选持久化：通过 `WithRepository` 注入 `ports.StandardReadingRepository` 后，处理结果会自动以 `UpsertStrategyHighPriorityWins` 策略落库。
 
 ```go
-// 1. 初始化 SQLite 仓库
-db, _ := sql.Open("sqlite3", "./prism.db")
-repo, _ := sqlite.NewSqliteRepository(db)
+standardizer := services.NewCoreStandardizer(
+    services.WithRepository(repo), // 实现 ports.StandardReadingRepository
+)
 
-// 2. 注入到 Standardizer
-standardizer := services.NewCoreStandardizer(10000, repo, chain...)
-
-// 3. 处理并自动保存
-// ProcessAndStandardize 内部如果配置了 repo，会尝试保存结果
-// (注: 当前 CoreStandardizer 实现可能需要更新以调用 Save，视具体实现而定，
-//  默认 ProcessAndStandardize 主要是计算，持久化通常由应用层编排，
-//  但在本示例架构中，CoreStandardizer 包含 repo 字段，可直接集成)
+// 查询特定时间点的标准读数 (需要已注入仓储)
+sr, err := standardizer.GetStandardReading(ctx, "D1", t)
 ```
+
+### 5. 动态规则加载 (Dynamic Rules)
+
+按设备类型从仓储加载清洗规则时，需要同时注入规则仓储与规则工厂：
+
+```go
+standardizer := services.NewCoreStandardizer(
+    services.WithRuleRepository(ruleRepo),   // 实现 ports.CleaningRuleRepository
+    services.WithRuleFactory(factory.GetRuleFactory()), // ports.CleaningRuleFactory
+)
+```
+
+> 依赖倒置：核心层只依赖 `ports.CleaningRuleFactory` 接口，不直接依赖 `pkg/adapters`。
 
 ## 🛠 开发与测试
 

@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/renjie/prism-core/pkg/adapters/factory"
 	"github.com/renjie/prism-core/pkg/core/domain"
 	"github.com/renjie/prism-core/pkg/core/ports"
 )
 
 // cleanWithDynamicRules 根据设备类型动态加载规则进行清洗
 func (s *CoreStandardizer) cleanWithDynamicRules(ctx context.Context, readings []domain.Reading) ([]domain.Reading, []domain.QuarantineReading, error) {
+	// 0. 前置条件: 必须注入规则工厂 (依赖倒置，避免核心层依赖适配器层)
+	if s.ruleFactory == nil {
+		return nil, nil, fmt.Errorf("rule factory not configured: dynamic cleaning requires WithRuleFactory")
+	}
+
 	// 1. Group by DeviceType
 	typeGroups := make(map[domain.DeviceType][]domain.Reading)
 	for _, r := range readings {
@@ -40,7 +44,7 @@ func (s *CoreStandardizer) cleanWithDynamicRules(ctx context.Context, readings [
 
 			// b. Convert Rules
 			var execRules []ports.CleaningRule
-			ruleFactory := factory.GetRuleFactory()
+			ruleFactory := s.ruleFactory
 
 			for _, dr := range domainRules {
 				idx, err := ruleFactory.CreateRule(dr)

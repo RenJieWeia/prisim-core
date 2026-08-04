@@ -4,9 +4,11 @@ package domain
 type RuleType string
 
 const (
-	RuleTypeRange RuleType = "RANGE" // 范围检查 (Min/Max)
-	RuleTypeRate  RuleType = "RATE"  // 变化率检查
-	RuleTypeTrend RuleType = "TREND" // 趋势检查
+	RuleTypeRange      RuleType = "RANGE"      // 范围检查 (Min/Max)
+	RuleTypeRate       RuleType = "RATE"       // 变化率检查 (尖峰/跳变检测)
+	RuleTypeTrend      RuleType = "TREND"      // 趋势检查 (预留)
+	RuleTypeMonotonic  RuleType = "MONOTONIC"  // 单调性检查 (防止累计值回退)
+	RuleTypeStagnation RuleType = "STAGNATION" // 停滞检查 (死传感器检测)
 )
 
 // RuleAction 定义规则触发后的处理策略

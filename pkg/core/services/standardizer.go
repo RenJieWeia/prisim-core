@@ -19,9 +19,11 @@ type CoreStandardizer struct {
 	sanitizer        ports.Sanitizer
 	aligner          ports.Aligner
 	standardInterval time.Duration
+	precisionFactor  int                             // 精度因子 (默认 10000，即 4 位小数)
 	concurrencyLimit int                             // 并发限制
 	repo             ports.StandardReadingRepository // 可选持久层依赖
 	ruleRepo         ports.CleaningRuleRepository    // 可选规则持久层
+	ruleFactory      ports.CleaningRuleFactory       // 可选规则工厂 (动态清洗依赖)
 	quarantineRepo   ports.QuarantineRepository      // 可选隔离区持久层 (for Bad Data)
 }
 
@@ -47,6 +49,23 @@ func WithAlignment(interval, tolerance time.Duration) StandardizerOption {
 	return func(s *CoreStandardizer) {
 		s.standardInterval = interval
 		s.aligner = domain.NewAligner(tolerance)
+	}
+}
+
+// WithPrecision 设置精度因子 (即 ValueScaled 的缩放倍数，默认 10000 = 4 位小数)
+// 注意: 精度转换使用 int64 截断而非四舍五入 (测试固定了该行为)
+func WithPrecision(factor int) StandardizerOption {
+	return func(s *CoreStandardizer) {
+		if factor > 0 {
+			s.precisionFactor = factor
+		}
+	}
+}
+
+// WithRuleFactory 设置清洗规则工厂依赖 (启用动态清洗时的必要注入)
+func WithRuleFactory(f ports.CleaningRuleFactory) StandardizerOption {
+	return func(s *CoreStandardizer) {
+		s.ruleFactory = f
 	}
 }
 
@@ -81,6 +100,7 @@ func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataStandardize
 		sanitizer:        NewSanitizer(),                 // 默认无规则
 		aligner:          domain.NewAligner(time.Minute), // 默认容差 1m
 		standardInterval: 15 * time.Minute,               // 默认间隔 15m
+		precisionFactor:  DefaultScaleFactor,             // 默认精度 4 位小数
 		concurrencyLimit: 100,                            // 默认并发 100
 		repo:             nil,
 	}
@@ -250,14 +270,14 @@ func (s *CoreStandardizer) standardizeOne(ctx context.Context, r domain.Reading)
 
 	// 精度转换: 浮点数 -> 高精度整型
 	// 例如: 123.4567 * 10000 = 1234567
-	scaledValue := int64(r.Value * float64(DefaultScaleFactor))
+	scaledValue := int64(r.Value * float64(s.precisionFactor))
 
 	// 2. 结构封装
 	return domain.StandardReading{
 		DeviceID:     r.DeviceInfo.ID,
 		Timestamp:    r.Timestamp,
 		ValueScaled:  scaledValue,
-		ScaleFactor:  DefaultScaleFactor,
+		ScaleFactor:  s.precisionFactor,
 		ValueDisplay: r.Value,
 		SourceType:   domain.ReadingTypeStandard,
 		Quality:      domain.QualityValid, // 经过清洗剩下的都是有效值

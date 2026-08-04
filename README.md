@@ -13,8 +13,10 @@ This library is designed to be imported by other services (HTTP APIs, CLI tools,
   - **Strategy Pattern** based cleaning rules.
   - **Pluggable Rules**:
     - `MonotonicRule`: Prevents negative accumulation/regressions.
-    - `JumpRule`: Detects and filters impossible spikes.
+    - `RateRule`: Detects and filters impossible spikes (jumps).
     - `StagnationRule`: Identifies dead sensors.
+    - `RangeRule`: Min/Max threshold checks with optional clamping.
+    - Rules are instantiated from config via `RuleFactory` (RANGE / MONOTONIC / RATE / STAGNATION).
   - **Chain of Responsibility**: `Sanitizer` runs a configurable chain of filters.
 - **Data Standardization**:
   - **Precision Control**: `Unifier` converts floating-point readings to high-precision integer scaled values (e.g., kWh to micro-kWh) to eliminate floating-point arithmetic errors.
@@ -60,16 +62,16 @@ package main
 import (
     "context"
     "fmt"
-    "os"
-    
+
     // Import from the public package path
+    "github.com/renjie/prism-core/pkg/adapters/ingest"
     "github.com/renjie/prism-core/pkg/core/services"
     "github.com/renjie/prism-core/pkg/core/domain"
 )
 
 func main() {
     // 1. Setup Ingestion
-    ingestor := services.NewJsonUniversalIngestor(func(ctx context.Context, readings []domain.Reading) error {
+    ingestor := ingest.NewJsonUniversalIngestor(func(ctx context.Context, readings []domain.Reading) error {
         fmt.Printf("Received batch of %d readings\n", len(readings))
         return nil
     })
@@ -112,6 +114,16 @@ func (r *MaxLimitRule) Check(ctx ports.CleaningContext, curr domain.Reading) por
 // Injected via functional options
 svc := services.NewCoreStandardizer(services.WithCleaningRules(&MaxLimitRule{100}))
 ```
+
+For **dynamic rule loading** (rules configured per device type in a repository), you must inject both a rule repository and a rule factory:
+
+```go
+svc := services.NewCoreStandardizer(
+    services.WithRuleRepository(ruleRepo),   // ports.CleaningRuleRepository
+    services.WithRuleFactory(factory.GetRuleFactory()), // ports.CleaningRuleFactory
+)
+```
+The `CoreStandardizer` core layer depends only on the `ports.CleaningRuleFactory` interface, never on `pkg/adapters` directly.
 
 ### Precision Conversion
 The `CoreStandardizer` handles the conversion between "Human Readable" floats and "Machine Precise" integers automatically.
