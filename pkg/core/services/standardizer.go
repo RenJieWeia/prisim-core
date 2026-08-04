@@ -14,9 +14,9 @@ import (
 )
 
 // CoreStandardizer 核心数据标准化服务
-// 实现了 EnergyDataStandardizer 接口
+// 同时实现旧接口 ports.EnergyDataStandardizer 与新接口 ports.EnergyDataProcessor。
 type CoreStandardizer struct {
-	sanitizer        ports.Sanitizer
+	sanitizer        *ChainSanitizer
 	aligner          ports.Aligner
 	standardInterval time.Duration
 	precisionFactor  int                             // 精度因子 (默认 10000，即 4 位小数)
@@ -27,10 +27,10 @@ type CoreStandardizer struct {
 	quarantineRepo   ports.QuarantineRepository      // 可选隔离区持久层 (for Bad Data)
 
 	// 参考对象与下游输出 (本轮新增)
-	cleaningRules   []ports.CleaningRule  // 静态配置的旧规则 (WithCleaningRules)
-	referenceRules  []any                 // 静态配置的参考规则 (WithReferenceRules)
-	referenceSource ports.ReferenceSource // 历史仓储参考源 (可选)
-	resultSinks     []ports.ResultSink    // 下游输出端口
+	cleaningRules   []ports.CleaningRule          // 静态配置的旧规则 (WithCleaningRules)
+	referenceRules  []ports.ReferenceCleaningRule // 静态配置的参考规则 (WithReferenceRules)
+	referenceSource ports.ReferenceSource         // 历史仓储参考源 (可选)
+	resultSinks     []ports.ResultSink            // 下游输出端口
 }
 
 // StandardizerOption 定义配置选项函数 (Functional Option Pattern)
@@ -89,8 +89,8 @@ func WithCleaningRules(rules ...ports.CleaningRule) StandardizerOption {
 	}
 }
 
-// WithReferenceRules 设置参考规则 (参考规则接口，可混合旧规则)
-func WithReferenceRules(rules ...any) StandardizerOption {
+// WithReferenceRules 设置参考规则 (仅参考规则接口)
+func WithReferenceRules(rules ...ports.ReferenceCleaningRule) StandardizerOption {
 	return func(s *CoreStandardizer) {
 		s.referenceRules = append(s.referenceRules, rules...)
 	}
@@ -121,10 +121,10 @@ func WithConcurrencyLimit(limit int) StandardizerOption {
 
 // NewCoreStandardizer 初始化标准化服务
 // 使用 Functional Options 模式进行配置
-func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataStandardizer {
+func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataProcessor {
 	// 默认配置
 	s := &CoreStandardizer{
-		sanitizer:        NewSanitizer(),                 // 默认无规则
+		sanitizer:        newChainSanitizer(nil, nil),    // 默认无规则
 		aligner:          domain.NewAligner(time.Minute), // 默认容差 1m
 		standardInterval: 15 * time.Minute,               // 默认间隔 15m
 		precisionFactor:  DefaultScaleFactor,             // 默认精度 4 位小数
@@ -137,14 +137,9 @@ func NewCoreStandardizer(opts ...StandardizerOption) ports.EnergyDataStandardize
 		opt(s)
 	}
 
-	// 选项应用完毕后统一构建清洗器 (允许旧规则与参考规则混合)
+	// 选项应用完毕后统一构建清洗器 (旧规则与参考规则由内部适配器组合)
 	if len(s.cleaningRules) > 0 || len(s.referenceRules) > 0 {
-		all := make([]any, 0, len(s.cleaningRules)+len(s.referenceRules))
-		for _, r := range s.cleaningRules {
-			all = append(all, r)
-		}
-		all = append(all, s.referenceRules...)
-		s.sanitizer = NewSanitizerWithReferences(all...)
+		s.sanitizer = newChainSanitizer(s.cleaningRules, s.referenceRules)
 	}
 
 	return s
@@ -174,6 +169,11 @@ func (s *CoreStandardizer) ProcessAndStandardize(ctx context.Context, rawReading
 //  3. 标准数据并发标准化与持久化
 //  4. 处理结果投递到下游输出端口
 func (s *CoreStandardizer) Process(ctx context.Context, rawReadings []domain.Reading) (domain.ProcessingResult, error) {
+	// Step 0: 配置校验 (持久化冲突检测) —— 处理前 fail-fast
+	if err := s.validatePersistence(); err != nil {
+		return domain.ProcessingResult{}, err
+	}
+
 	// Step 1: A. 数据清洗 (替别人做“脏活累活”)
 	// 剔除空值、负值、重复值和异常跳变
 	// 这一步是批量操作，因为清洗依赖上下文（如前后值的跳变）
@@ -318,13 +318,46 @@ func (s *CoreStandardizer) Process(ctx context.Context, rawReadings []domain.Rea
 	}
 
 	// Step 4: 投递处理结果到下游输出端口
+	// 多个 Sink 投递不是原子操作: 全部执行, 收集所有错误 (每个错误含 Sink ID 与原始错误),
+	// 并始终返回已经生成的 ProcessingResult 供调用方检查与决定是否重试。
+	var sinkErrs []error
 	for _, sink := range s.resultSinks {
 		if err := sink.Deliver(ctx, result); err != nil {
-			return result, fmt.Errorf("sink %s deliver failed: %w", sink.ID(), err)
+			sinkErrs = append(sinkErrs, fmt.Errorf("sink %q deliver failed: %w", sink.ID(), err))
 		}
+	}
+	if len(sinkErrs) > 0 {
+		return result, errors.Join(sinkErrs...)
 	}
 
 	return result, nil
+}
+
+// validatePersistence 持久化冲突检测
+// 同一处理结果不得被多个持久化目标重复 SaveBatch:
+//   - WithRepository 直接持久化
+//   - RepositoryAwareSink (如 RepositorySink) 同样持久化 Accepted
+//
+// 同一仓储同时作为直接持久化目标与 Sink 持久化目标时，返回明确配置错误。
+func (s *CoreStandardizer) validatePersistence() error {
+	targets := make(map[ports.StandardReadingRepository]string)
+	if s.repo != nil {
+		targets[s.repo] = "WithRepository"
+	}
+	for _, snk := range s.resultSinks {
+		ra, ok := snk.(ports.RepositoryAwareSink)
+		if !ok {
+			continue
+		}
+		repo := ra.Repository()
+		if src, dup := targets[repo]; dup {
+			return fmt.Errorf(
+				"duplicate persistence target: %s and RepositorySink(%q) both persist to the same StandardReadingRepository; use only one of WithRepository / RepositorySink",
+				src, snk.ID())
+		}
+		targets[repo] = fmt.Sprintf("RepositorySink(%q)", snk.ID())
+	}
+	return nil
 }
 
 // DefaultScaleFactor 默认精度因子 (支持4位小数精度)

@@ -43,6 +43,13 @@ type Sanitizer interface {
 	// 2. quarantined: 违反规则被拒绝的次品数据 (包含拒绝原因)
 	// 注意: 返回的 clean 数据已按时间戳升序排列
 	Clean(readings []domain.Reading) (clean []domain.Reading, quarantined []domain.QuarantineReading)
+}
+
+// ReferenceSanitizer 支持参考对象的清洗器接口 (Sanitizer 的扩展)
+// Clean 由 Sanitizer 继承，仅适用于旧规则；含参考规则时必须使用
+// CleanWithReferences，否则参考源配置错误会被吞掉。
+type ReferenceSanitizer interface {
+	Sanitizer
 
 	// CleanWithReferences 带参考数据源的清洗逻辑
 	// repoRefs 为历史仓储参考源 (可为 nil，此时 STANDARD_REPO 类型的参考请求会报错)。

@@ -168,7 +168,7 @@ func TestCoreStandardizerDeliversToSinks(t *testing.T) {
 	}
 }
 
-// TestSinkErrorPropagates Sink 错误能够正确返回
+// TestSinkErrorPropagates Sink 错误能够正确返回 (含 Sink ID 与原始错误, 且返回已生成的 ProcessingResult)
 func TestSinkErrorPropagates(t *testing.T) {
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	bad := sink.NewCallbackSink("bad", func(_ context.Context, _ domain.ProcessingResult) error {
@@ -179,12 +179,55 @@ func TestSinkErrorPropagates(t *testing.T) {
 	raw := []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
 	}
-	_, err := std.Process(context.Background(), raw)
+	result, err := std.Process(context.Background(), raw)
 	if err == nil {
 		t.Fatal("expected error from sink to propagate")
 	}
+	// 错误必须包含 Sink ID 与原始错误
+	if !strings.Contains(err.Error(), `sink "bad"`) {
+		t.Errorf("expected error to contain sink ID 'bad', got %v", err)
+	}
 	if !strings.Contains(err.Error(), "boom") {
 		t.Errorf("expected error to contain 'boom', got %v", err)
+	}
+	// 即使 Sink 投递失败，也返回已经生成的 ProcessingResult
+	if len(result.Accepted) != 1 {
+		t.Errorf("expected ProcessingResult still returned with accepted data, got %d", len(result.Accepted))
+	}
+}
+
+// TestSinkPartialFailureDeliversAll 多 Sink 部分失败: 其余 Sink 仍收到结果, 错误聚合所有失败
+func TestSinkPartialFailureDeliversAll(t *testing.T) {
+	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
+	good := sink.NewMemorySink()
+	bad1 := sink.NewCallbackSink("bad-1", func(_ context.Context, _ domain.ProcessingResult) error {
+		return errors.New("first boom")
+	})
+	bad2 := sink.NewCallbackSink("bad-2", func(_ context.Context, _ domain.ProcessingResult) error {
+		return errors.New("second boom")
+	})
+
+	std := services.NewCoreStandardizer(services.WithResultSinks(good, bad1, bad2))
+	raw := []domain.Reading{
+		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
+	}
+	result, err := std.Process(context.Background(), raw)
+	if err == nil {
+		t.Fatal("expected aggregated sink errors")
+	}
+	// 两个失败 Sink 的错误都包含其 ID 与原始错误
+	for _, want := range []string{`sink "bad-1"`, "first boom", `sink "bad-2"`, "second boom"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected error to contain %q, got: %v", want, err)
+		}
+	}
+	// 其余 Sink 仍然收到结果 (非原子投递)
+	if good.Count() != 1 {
+		t.Errorf("expected good sink to still receive result, got %d", good.Count())
+	}
+	// 返回已经生成的 ProcessingResult
+	if len(result.Accepted) != 1 {
+		t.Errorf("expected ProcessingResult still returned, got %d accepted", len(result.Accepted))
 	}
 }
 

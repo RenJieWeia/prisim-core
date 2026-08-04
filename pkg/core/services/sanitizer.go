@@ -18,22 +18,31 @@ type ChainSanitizer struct {
 
 // NewSanitizer 创建默认的基于规则链的清洗器 (仅支持旧规则)
 func NewSanitizer(rules ...ports.CleaningRule) ports.Sanitizer {
-	all := make([]any, 0, len(rules))
-	for _, r := range rules {
-		all = append(all, r)
-	}
-	return &ChainSanitizer{rules: all}
+	return newChainSanitizer(rules, nil)
 }
 
-// NewSanitizerWithReferences 创建支持参考对象的清洗器
-// rules 可混合传入 ports.CleaningRule 与 ports.ReferenceCleaningRule。
-func NewSanitizerWithReferences(rules ...any) ports.Sanitizer {
+// NewSanitizerWithReferences 创建支持参考对象的清洗器 (仅支持参考规则)
+// 旧规则与参考规则的组合由 CoreStandardizer 内部通过 newChainSanitizer 完成。
+func NewSanitizerWithReferences(rules ...ports.ReferenceCleaningRule) ports.ReferenceSanitizer {
+	return newChainSanitizer(nil, rules)
+}
+
+// newChainSanitizer 内部构造器: 组合旧规则与参考规则 (调用方不传任意类型)
+func newChainSanitizer(legacy []ports.CleaningRule, refs []ports.ReferenceCleaningRule) *ChainSanitizer {
+	rules := make([]any, 0, len(legacy)+len(refs))
+	for _, r := range legacy {
+		rules = append(rules, r)
+	}
+	for _, r := range refs {
+		rules = append(rules, r)
+	}
 	return &ChainSanitizer{rules: rules}
 }
 
 // Clean 实现 ports.Sanitizer 接口
 // 返回的 clean 数据已按时间戳升序排列。
-// 该方法为向后兼容保留，内部委托给 CleanWithReferences (不配置历史仓储参考源)。
+// 该方法仅供旧规则使用; 含参考规则的清洗器必须使用 CleanWithReferences，
+// 否则参考源配置错误会被吞掉 (Clean 无错误返回)。
 func (s *ChainSanitizer) Clean(readings []domain.Reading) ([]domain.Reading, []domain.QuarantineReading) {
 	res, _ := s.CleanWithReferences(context.Background(), readings, nil)
 	return res.Clean, res.Quarantined
@@ -54,6 +63,11 @@ func (s *ChainSanitizer) cleanInternal(ctx context.Context, readings []domain.Re
 	res := ports.CleanResult{}
 	if len(readings) == 0 {
 		return res, nil
+	}
+
+	// 0. 配置校验: 参考源缺失 / Offset 非法必须在处理前报错，不得静默退化
+	if err := validateRulesForReferences(s.rules, repoRefs); err != nil {
+		return res, err
 	}
 
 	// 1. 拷贝 + 时间排序 (不修改调用方切片)
@@ -126,6 +140,34 @@ func (s *ChainSanitizer) cleanInternal(ctx context.Context, readings []domain.Re
 	}
 
 	return res, nil
+}
+
+// validateRulesForReferences 参考规则配置校验 (处理前 fail-fast)
+//  1. 规则声明 STANDARD_REPO 参考对象但没有可用仓储参考源 -> 配置错误
+//  2. RELATIVE/WINDOW 模式的 Offset 为负 -> 配置错误
+//
+// 仅当校验通过后，参考缺失策略 (SKIP_RULE/REJECT/QUARANTINE) 才会因"查无数据"而触发。
+func validateRulesForReferences(rules []any, repoRefs ports.ReferenceSource) error {
+	for _, rule := range rules {
+		rr, ok := rule.(ports.ReferenceCleaningRule)
+		if !ok {
+			continue
+		}
+		for _, spec := range rr.ReferenceSpecs() {
+			if spec.Source == domain.ReferenceSourceStandardRepo && repoRefs == nil {
+				return fmt.Errorf(
+					"reference rule %q declares spec %q with STANDARD_REPO source, but no repository reference source is configured",
+					rr.RuleID(), spec.ID)
+			}
+			if (spec.Time.Mode == domain.ReferenceTimeRelative ||
+				spec.Time.Mode == domain.ReferenceTimeWindow) && spec.Time.Offset < 0 {
+				return fmt.Errorf(
+					"reference rule %q spec %q: negative Offset %v is not allowed (Offset must be non-negative, target = current.Timestamp - Offset)",
+					rr.RuleID(), spec.ID, spec.Time.Offset)
+			}
+		}
+	}
+	return nil
 }
 
 // ruleVerdict 单条规则的执行判定结果

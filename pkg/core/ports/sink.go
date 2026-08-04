@@ -18,3 +18,12 @@ type ResultSink interface {
 		result domain.ProcessingResult,
 	) error
 }
+
+// RepositoryAwareSink 暴露仓储的输出端口
+// 用于检测 WithRepository 与 RepositorySink 指向同一仓储时的重复持久化。
+type RepositoryAwareSink interface {
+	ResultSink
+
+	// Repository 返回该输出端口持久化所用的标准读数仓储
+	Repository() StandardReadingRepository
+}

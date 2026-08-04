@@ -220,7 +220,8 @@ func (r *ReferenceResolver) sourceFor(kind domain.ReferenceSourceKind) (ports.Re
 }
 
 // buildReferenceRequest 将 ReferenceSpec + 当前读数解析为具体的参考查询请求
-// 相对时间点以当前读数的 Timestamp 为基准 (current.Timestamp.Add(-offset))，不使用 time.Now()。
+// RELATIVE 目标时间以当前读数的 Timestamp 为基准 (target = current.Timestamp - Offset，
+// Offset 为非负且向历史方向偏移)，不使用 time.Now()。
 func buildReferenceRequest(spec domain.ReferenceSpec, current domain.Reading) (domain.ReferenceRequest, bool) {
 	deviceID := current.DeviceInfo.ID
 	if spec.Binding == domain.ReferenceBindingExplicit {

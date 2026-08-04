@@ -39,9 +39,11 @@ const (
 )
 
 // ReferenceTimeSelector 时间选择器
-// Offset 含义随 Mode 变化:
-//   - RELATIVE: 相对当前数据时间往回偏移的时长 (目标时间 = 当前时间 - Offset)
-//   - WINDOW:   窗口长度 (窗口 = [当前时间-Offset, 当前时间))
+// Offset 为非负持续时间，表示向历史方向偏移，Offset 含义随 Mode 变化:
+//   - RELATIVE: 目标时间 = 当前时间 - Offset (三天前 = Offset: 72h)
+//   - WINDOW:   窗口 = [当前时间-Offset, 当前时间)
+//
+// Offset 为负会在校验阶段报错。
 //
 // Tolerance 仅 RELATIVE 模式使用: 在 [目标时间-Tolerance, 目标时间+Tolerance] 内查找。
 // 若 Tolerance <= 0，则要求目标时间点上存在精确数据。
