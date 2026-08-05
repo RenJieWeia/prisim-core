@@ -26,8 +26,7 @@
 - **下游输出 (Downstream Output)** (v1.1+): 应用层管线（`ProcessingPipeline` + `ResultSink`，如 `MemorySink` / `CallbackSink` / `RepositorySink` / `QuarantineSink`）持久化 Accepted/Rejected 并在每次处理后接收完整结果；多个 Sink 失败时错误聚合返回，绝不静默丢弃。
 - **多设备状态隔离**: 有状态规则按**设备**分别维护"上一条有效数据"，交错的多设备数据互不污染，且不原地修改调用方传入的数据切片。
 - **并发安全**:
-  - 异步操作带有超时控制和错误日志。
-  - 使用 `errors.Join()` 聚合并发错误。
+  - 按设备分片并使用有界信号量限制并发，处理错误通过 `errors.Join()` 聚合返回。
 - **架构设计**:
   - **Domain (领域层)**: 核心业务实体与接口定义 (`pkg/core/domain`)，含 `ReferenceSpec`、`ProcessingResult` 等。
   - **Services (服务层)**: 业务流程编排 (`pkg/core/services`)，包含 Sanitizer 与 Standardizer 实现、`BatchReferenceSource`/`ReferenceResolver`。
