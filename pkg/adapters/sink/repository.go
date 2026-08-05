@@ -25,12 +25,6 @@ func (s *RepositorySink) ID() string {
 	return s.id
 }
 
-// Repository 实现 ports.RepositoryAwareSink 接口
-// 暴露持久化所用的仓储，供核心层检测重复持久化。
-func (s *RepositorySink) Repository() ports.StandardReadingRepository {
-	return s.repo
-}
-
 // Deliver 实现 ports.ResultSink 接口
 // 仅保存 Accepted 中的标准数据，隔离数据由隔离区仓储处理。
 func (s *RepositorySink) Deliver(ctx context.Context, result domain.ProcessingResult) error {

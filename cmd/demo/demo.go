@@ -10,6 +10,8 @@ import (
 
 	"github.com/renjie/prism-core/pkg/adapters/factory"
 	"github.com/renjie/prism-core/pkg/adapters/ingest"
+	"github.com/renjie/prism-core/pkg/adapters/sink"
+	"github.com/renjie/prism-core/pkg/application/pipeline"
 	"github.com/renjie/prism-core/pkg/core/domain"
 	"github.com/renjie/prism-core/pkg/core/ports"
 	"github.com/renjie/prism-core/pkg/core/services"
@@ -180,8 +182,8 @@ func sampleReadings() []annotated {
 	}
 }
 
-// newDemoStandardizer 构建带完整规则链的标准化服务
-func newDemoStandardizer(opts ...services.StandardizerOption) ports.EnergyDataStandardizer {
+// newDemoStandardizer 构建带完整规则链的标准化服务 (返回完整处理接口)
+func newDemoStandardizer(opts ...services.StandardizerOption) ports.EnergyDataProcessor {
 	defaults := []services.StandardizerOption{
 		services.WithCleaningRules(
 			&rules.RangeRule{Min: 0, Max: 10000, Action: domain.ActionReject},
@@ -192,7 +194,7 @@ func newDemoStandardizer(opts ...services.StandardizerOption) ports.EnergyDataSt
 		services.WithAlignment(15*time.Minute, 5*time.Minute),
 		services.WithPrecision(10000),
 	}
-	return services.NewCoreStandardizer(append(defaults, opts...)...)
+	return services.NewEnergyDataProcessor(append(defaults, opts...)...)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,21 +248,28 @@ func runScriptedDemo() {
 	}
 
 	// ---------- 第 4 节: 标准化层 ----------
-	fmt.Println("\n[4/6] 标准化层 (CoreStandardizer) —— 时间对齐 15min 网格 + 精度 ×10000 (int64 截断)")
+	fmt.Println("\n[4/6] 标准化层 (CoreStandardizer + ProcessingPipeline) —— 时间对齐 15min 网格 + 精度 ×10000 (int64 截断)")
 	standardsRepo := newMemoryStandardsRepo()
-	std := newDemoStandardizer(services.WithRepository(standardsRepo))
+	quarantineRepo := &memoryQuarantineRepo{}
+	proc := newDemoStandardizer(services.WithRepository(standardsRepo)) // 仓储仅用于 GetStandardReading 查询
+	pl := pipeline.NewProcessingPipeline(
+		proc,
+		sink.NewRepositorySink(standardsRepo, ports.UpsertStrategyHighPriorityWins),
+		sink.NewQuarantineSink(quarantineRepo),
+	)
 
-	standards, err := std.ProcessAndStandardize(ctx, readings)
+	result, err := pl.Execute(ctx, readings)
 	if err != nil {
 		fmt.Printf("  标准化失败: %v\n", err)
 		os.Exit(1)
 	}
-	printStandards("  标准化结果", standards)
-	fmt.Println("  说明: 结果已按 UpsertStrategyHighPriorityWins 策略持久化到内存仓储")
+	printStandards("  标准化结果", result.Accepted)
+	fmt.Println("  说明: RepositorySink 已按 UpsertStrategyHighPriorityWins 持久化 Accepted 到内存仓储")
+	fmt.Printf("  说明: QuarantineSink 已保存 %d 条隔离数据到隔离区仓储\n", quarantineRepo.count())
 
 	// ---------- 第 5 节: 查询层 ----------
 	fmt.Println("\n[5/6] 查询层 —— 从仓储读取标准读数")
-	sr, err := std.GetStandardReading(ctx, demoDevice1, mustParse("2026-08-04T10:00:00Z"))
+	sr, err := proc.GetStandardReading(ctx, demoDevice1, mustParse("2026-08-04T10:00:00Z"))
 	if err != nil {
 		fmt.Printf("  GetStandardReading 失败: %v\n", err)
 	} else if sr != nil {
@@ -297,11 +306,11 @@ func demoDynamicRules(ctx context.Context) {
 		},
 	}}
 	qRepo := &memoryQuarantineRepo{}
-	std := services.NewCoreStandardizer(
+	proc := services.NewEnergyDataProcessor(
 		services.WithRuleRepository(ruleRepo),
 		services.WithRuleFactory(factory.NewRuleFactory()),
-		services.WithQuarantineRepository(qRepo),
 	)
+	pl := pipeline.NewProcessingPipeline(proc, nil, sink.NewQuarantineSink(qRepo))
 	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
 	feed := []domain.Reading{
 		{DeviceInfo: domain.DeviceInfo{ID: "D-E1", Type: domain.DeviceTypeElec}, Timestamp: base, Value: 100},
@@ -309,17 +318,13 @@ func demoDynamicRules(ctx context.Context) {
 		{DeviceInfo: domain.DeviceInfo{ID: "D-E3", Type: domain.DeviceTypeElec}, Timestamp: base.Add(30 * time.Minute), Value: 200},
 	}
 	fmt.Println("  规则配置 (设备类型 ELEC): Range[0, 10000] REJECT")
-	out, err := std.ProcessAndStandardize(ctx, feed)
+	res, err := pl.Execute(ctx, feed)
 	if err != nil {
 		fmt.Printf("  动态清洗失败: %v\n", err)
 		return
 	}
-	// 隔离区保存是异步的，轮询等待
-	deadline := time.Now().Add(2 * time.Second)
-	for qRepo.count() != 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	fmt.Printf("  输入 3 条 ELEC 读数 -> 通过 %d 条, 隔离区 %d 条 (负值 -50 被 Range 规则拒绝)\n", len(out), qRepo.count())
+	// QuarantineSink 同步保存隔离数据
+	fmt.Printf("  输入 3 条 ELEC 读数 -> 通过 %d 条, 隔离区 %d 条 (负值 -50 被 Range 规则拒绝)\n", len(res.Accepted), qRepo.count())
 }
 
 // demoIngestor 演示 UniversalIngestor 接入器全链路

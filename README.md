@@ -23,7 +23,7 @@ This library is designed to be imported by other services (HTTP APIs, CLI tools,
   - **Time Alignment**: `Aligner` (O(log n) binary search) snaps readings to standard intervals (Snapshots) within a configurable tolerance.
 - **Reference Objects** (v1.1+): rules can compare the current reading against reference data — the same device's **previous valid value**, a value at a **relative point in time** (e.g. 3 days ago, anchored to the reading's own `Timestamp`, never `time.Now()`), or a **rolling time window** aggregated via `AVG`/`SUM`/`MIN`/`MAX`/`LATEST`/`DELTA`. Missing references are handled per-spec via `SKIP_RULE` / `REJECT` / `QUARANTINE`.
 - **Full Processing Result** (v1.1+): `Process` (via `NewEnergyDataProcessor`) returns `ProcessingResult{Accepted, Rejected, Evaluations}` including per-rule evaluations (`PASS`/`REJECT`/`SKIP`/`CORRECT`/`QUARANTINE`) with the referenced object IDs and reasons.
-- **Downstream Output** (v1.1+): pluggable `ResultSink`s (`MemorySink`, `CallbackSink`, `RepositorySink`) receive the full result after every run; sink failures are aggregated (never silently dropped).
+- **Downstream Output** (v1.1+): the application layer (`ProcessingPipeline` + `ResultSink`s — `MemorySink`, `CallbackSink`, `RepositorySink`, `QuarantineSink`) persists `Accepted`/`Rejected` and receives the full result after every run; delivery failures are aggregated by sink ID and never silently dropped.
 - **Multi-Device Isolation**: stateful rules keep a **per-device** "last valid reading", so interleaved devices never pollute each other's context, and the caller's input slice is never mutated in place.
 - **Hexagonal Architecture**:
   - **Domain**: Pure business logic & entities (`pkg/core/domain`) — `Reading`, `StandardReading`, `ReferenceSpec`, `ProcessingResult`, `Aligner`, `IngestContext`.
@@ -232,16 +232,25 @@ Wire the rule, an optional historical reference source, and get the full result:
 import (
     "github.com/renjie/prism-core/pkg/adapters/reference"
     "github.com/renjie/prism-core/pkg/adapters/sink"
+    "github.com/renjie/prism-core/pkg/application/pipeline"
     "github.com/renjie/prism-core/pkg/core/services"
 )
 
-std := services.NewEnergyDataProcessor(
+// Core processor: cleaning + reference resolution + standardization only.
+proc := services.NewEnergyDataProcessor(
     services.WithReferenceRules(&RefGeRule{Spec: spec}),           // ports.ReferenceCleaningRule
     services.WithReferenceSource(reference.NewRepositoryReferenceSource(repo, time.Minute)), // STANDARD_REPO source
-    services.WithResultSinks(sink.NewMemorySink()),                // optional downstream output
 )
 
-result, err := std.Process(ctx, rawReadings)
+// Application pipeline: persistence (Accepted/Rejected) + downstream sinks.
+pl := pipeline.NewProcessingPipeline(
+    proc,
+    sink.NewRepositorySink(repo, ports.UpsertStrategyHighPriorityWins), // Accepted
+    sink.NewQuarantineSink(quarantineRepo),                             // Rejected
+    sink.NewMemorySink(),                                               // optional other sinks
+)
+
+result, err := pl.Execute(ctx, rawReadings)
 // result.Accepted    []domain.StandardReading
 // result.Rejected    []domain.QuarantineReading
 // result.Evaluations []domain.RuleEvaluation  // RuleID / Outcome / Reason / ReferenceIDs
@@ -252,8 +261,8 @@ Notes:
 - `ReferenceSource` is the query port (`Resolve(ctx, requests)`); rules never touch the database directly. Built-ins: `BatchReferenceSource` (current batch) and `RepositoryReferenceSource` (historical `StandardReadingRepository`), with per-run in-memory dedup of identical requests.
 - A `STANDARD_REPO` spec without a configured source, or a negative `RELATIVE`/`WINDOW` `Offset`, fails fast with a clear config error — reference rules never silently degrade.
 - `SKIP_RULE`/`REJECT`/`QUARANTINE` are applied **only** when a reference is genuinely not found.
-- `RepositorySink` persists `Accepted` into a `StandardReadingRepository`; combining it with `WithRepository` on the same repository is rejected as a duplicate-persistence configuration error.
-- The `pkg/adapters/reference` and `pkg/adapters/sink` packages implement the infrastructure, keeping `pkg/core` free of adapter imports.
+- Persistence and sink delivery live in the application layer: `ProcessingPipeline` + `RepositorySink` (Accepted) / `QuarantineSink` (Rejected) + extra sinks. `WithRepository` only feeds `GetStandardReading` queries and no longer writes during `Process`.
+- The `pkg/adapters/reference`, `pkg/adapters/sink` and `pkg/application/pipeline` packages implement the infrastructure, keeping `pkg/core` free of adapter imports.
 
 ## 📄 License
 MIT

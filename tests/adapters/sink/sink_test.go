@@ -2,8 +2,6 @@ package sink_test
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,7 +9,6 @@ import (
 	"github.com/renjie/prism-core/pkg/adapters/sink"
 	"github.com/renjie/prism-core/pkg/core/domain"
 	"github.com/renjie/prism-core/pkg/core/ports"
-	"github.com/renjie/prism-core/pkg/core/services"
 )
 
 func sampleResult() domain.ProcessingResult {
@@ -133,101 +130,6 @@ func TestRepositorySinkEmptyAccepted(t *testing.T) {
 	defer repo.mu.Unlock()
 	if len(repo.saved) != 0 {
 		t.Errorf("expected no saves for empty accepted, got %d", len(repo.saved))
-	}
-}
-
-// TestCoreStandardizerDeliversToSinks 集成: CoreStandardizer.Process 投递到多个 Sink
-func TestCoreStandardizerDeliversToSinks(t *testing.T) {
-	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
-	ms := sink.NewMemorySink()
-	var cbGot *domain.ProcessingResult
-	cb := sink.NewCallbackSink("cb", func(_ context.Context, result domain.ProcessingResult) error {
-		cp := result
-		cbGot = &cp
-		return nil
-	})
-
-	std := services.NewEnergyDataProcessor(services.WithResultSinks(ms, cb))
-	raw := []domain.Reading{
-		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
-		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base.Add(15 * time.Minute), Value: 90},
-	}
-	result, err := std.Process(context.Background(), raw)
-	if err != nil {
-		t.Fatalf("Process failed: %v", err)
-	}
-
-	if ms.Count() != 1 {
-		t.Fatalf("expected MemorySink to receive 1 result, got %d", ms.Count())
-	}
-	if cbGot == nil {
-		t.Fatal("expected CallbackSink to receive result")
-	}
-	if len(result.Accepted) != len(ms.Results()[0].Accepted) {
-		t.Errorf("unexpected delivered result")
-	}
-}
-
-// TestSinkErrorPropagates Sink 错误能够正确返回 (含 Sink ID 与原始错误, 且返回已生成的 ProcessingResult)
-func TestSinkErrorPropagates(t *testing.T) {
-	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
-	bad := sink.NewCallbackSink("bad", func(_ context.Context, _ domain.ProcessingResult) error {
-		return errors.New("boom")
-	})
-
-	std := services.NewEnergyDataProcessor(services.WithResultSinks(bad))
-	raw := []domain.Reading{
-		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
-	}
-	result, err := std.Process(context.Background(), raw)
-	if err == nil {
-		t.Fatal("expected error from sink to propagate")
-	}
-	// 错误必须包含 Sink ID 与原始错误
-	if !strings.Contains(err.Error(), `sink "bad"`) {
-		t.Errorf("expected error to contain sink ID 'bad', got %v", err)
-	}
-	if !strings.Contains(err.Error(), "boom") {
-		t.Errorf("expected error to contain 'boom', got %v", err)
-	}
-	// 即使 Sink 投递失败，也返回已经生成的 ProcessingResult
-	if len(result.Accepted) != 1 {
-		t.Errorf("expected ProcessingResult still returned with accepted data, got %d", len(result.Accepted))
-	}
-}
-
-// TestSinkPartialFailureDeliversAll 多 Sink 部分失败: 其余 Sink 仍收到结果, 错误聚合所有失败
-func TestSinkPartialFailureDeliversAll(t *testing.T) {
-	base, _ := time.Parse(time.RFC3339, "2026-08-04T10:00:00Z")
-	good := sink.NewMemorySink()
-	bad1 := sink.NewCallbackSink("bad-1", func(_ context.Context, _ domain.ProcessingResult) error {
-		return errors.New("first boom")
-	})
-	bad2 := sink.NewCallbackSink("bad-2", func(_ context.Context, _ domain.ProcessingResult) error {
-		return errors.New("second boom")
-	})
-
-	std := services.NewEnergyDataProcessor(services.WithResultSinks(good, bad1, bad2))
-	raw := []domain.Reading{
-		{DeviceInfo: domain.DeviceInfo{ID: "D1"}, Timestamp: base, Value: 100},
-	}
-	result, err := std.Process(context.Background(), raw)
-	if err == nil {
-		t.Fatal("expected aggregated sink errors")
-	}
-	// 两个失败 Sink 的错误都包含其 ID 与原始错误
-	for _, want := range []string{`sink "bad-1"`, "first boom", `sink "bad-2"`, "second boom"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("expected error to contain %q, got: %v", want, err)
-		}
-	}
-	// 其余 Sink 仍然收到结果 (非原子投递)
-	if good.Count() != 1 {
-		t.Errorf("expected good sink to still receive result, got %d", good.Count())
-	}
-	// 返回已经生成的 ProcessingResult
-	if len(result.Accepted) != 1 {
-		t.Errorf("expected ProcessingResult still returned, got %d accepted", len(result.Accepted))
 	}
 }
 

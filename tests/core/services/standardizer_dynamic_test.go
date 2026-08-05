@@ -35,7 +35,7 @@ func (f *fakeRuleRepo) ListEnabledByDeviceType(_ context.Context, dt domain.Devi
 }
 func (f *fakeRuleRepo) Delete(_ context.Context, id string) error { return nil }
 
-// quarantineRecorder 记录异步保存的隔离区数据 (测试用)
+// quarantineRecorder 记录隔离区数据保存 (Core 不再自动保存，用于断言无副作用)
 type quarantineRecorder struct {
 	mu    sync.Mutex
 	saves []domain.QuarantineReading
@@ -65,10 +65,10 @@ func TestProcessWithDynamicRules(t *testing.T) {
 	}}
 	quarantine := &quarantineRecorder{}
 
-	standardizer := services.NewCoreStandardizer(
+	standardizer := services.NewEnergyDataProcessor(
 		services.WithRuleRepository(ruleRepo),
 		services.WithRuleFactory(factory.NewRuleFactory()),
-		services.WithQuarantineRepository(quarantine),
+		services.WithQuarantineRepository(quarantine), // 弃用选项: Core 不再自动保存隔离数据
 	)
 
 	readings := []domain.Reading{
@@ -76,21 +76,20 @@ func TestProcessWithDynamicRules(t *testing.T) {
 		{DeviceInfo: domain.DeviceInfo{ID: "D2", Type: domain.DeviceTypeElec}, Timestamp: base.Add(time.Minute), Value: -5}, // 越界
 	}
 
-	results, err := standardizer.ProcessAndStandardize(context.Background(), readings)
+	result, err := standardizer.Process(context.Background(), readings)
 	if err != nil {
 		t.Fatalf("Process failed: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 clean reading, got %d", len(results))
+	if len(result.Accepted) != 1 {
+		t.Fatalf("expected 1 clean reading, got %d", len(result.Accepted))
 	}
-
-	// 隔离区保存是异步的，轮询等待
-	deadline := time.Now().Add(2 * time.Second)
-	for quarantine.count() != 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// 越界数据进入 Rejected
+	if len(result.Rejected) != 1 || result.Rejected[0].Reading.Value != -5 {
+		t.Fatalf("expected 1 rejected reading (-5), got %+v", result.Rejected)
 	}
-	if quarantine.count() != 1 {
-		t.Fatalf("expected 1 quarantined reading saved, got %d", quarantine.count())
+	// Core 不再保存隔离数据
+	if quarantine.count() != 0 {
+		t.Fatalf("expected 0 quarantine saves from Core, got %d", quarantine.count())
 	}
 }
 

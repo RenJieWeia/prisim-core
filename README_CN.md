@@ -23,7 +23,7 @@
   - **时间对齐 (Aligner)**: 使用**二分查找算法** O(log n) 将散乱的时间点对齐到标准的整点快照。
 - **参考对象 (Reference Objects)** (v1.1+): 规则可比较"当前数据 vs 参考数据"——同一设备的**上一条有效值**、**相对时间点**数据（如三天前，以当前读数自身 `Timestamp` 为基准，绝不用 `time.Now()`）、或**时间窗口**聚合数据（`AVG`/`SUM`/`MIN`/`MAX`/`LATEST`/`DELTA`）。参考缺失按策略处理：`SKIP_RULE` / `REJECT` / `QUARANTINE`。
 - **完整处理结果 (Full Processing Result)** (v1.1+): `NewEnergyDataProcessor` 提供的 `Process` 返回 `ProcessingResult{Accepted, Rejected, Evaluations}`，含每条规则的评估记录（`PASS`/`REJECT`/`SKIP`/`CORRECT`/`QUARANTINE`）、使用的参考对象 ID 与原因。
-- **下游输出 (Downstream Output)** (v1.1+): 可插拔的 `ResultSink`（`MemorySink` / `CallbackSink` / `RepositorySink`）在每次处理后接收完整结果；多个 Sink 失败时错误聚合返回，绝不静默丢弃。
+- **下游输出 (Downstream Output)** (v1.1+): 应用层管线（`ProcessingPipeline` + `ResultSink`，如 `MemorySink` / `CallbackSink` / `RepositorySink` / `QuarantineSink`）持久化 Accepted/Rejected 并在每次处理后接收完整结果；多个 Sink 失败时错误聚合返回，绝不静默丢弃。
 - **多设备状态隔离**: 有状态规则按**设备**分别维护"上一条有效数据"，交错的多设备数据互不污染，且不原地修改调用方传入的数据切片。
 - **并发安全**:
   - 异步操作带有超时控制和错误日志。
@@ -164,20 +164,29 @@ for _, res := range results {
 // Standardized: 1050000 (Raw: 105.00)
 ```
 
-### 4. 数据持久化 (Persistence)
+### 4. 数据持久化与下游输出 (Persistence & Downstream)
 
-`ProcessAndStandardize` 支持可选持久化：通过 `WithRepository` 注入 `ports.StandardReadingRepository` 后，处理结果会自动以 `UpsertStrategyHighPriorityWins` 策略落库。
+持久化与 Sink 投递属于**应用层**：通过 `ProcessingPipeline` 组合 `RepositorySink`（保存 Accepted）与 `QuarantineSink`（保存 Rejected），并可追加其他 Sink。
 
 ```go
-standardizer := services.NewCoreStandardizer(
-    services.WithRepository(repo), // 实现 ports.StandardReadingRepository
+import (
+    "github.com/renjie/prism-core/pkg/adapters/sink"
+    "github.com/renjie/prism-core/pkg/application/pipeline"
+    "github.com/renjie/prism-core/pkg/core/services"
 )
 
-// 查询特定时间点的标准读数 (需要已注入仓储)
-sr, err := standardizer.GetStandardReading(ctx, "D1", t)
+proc := services.NewEnergyDataProcessor() // Core: 清洗 + 标准化
+pl := pipeline.NewProcessingPipeline(
+    proc,
+    sink.NewRepositorySink(repo, ports.UpsertStrategyHighPriorityWins), // 保存 Accepted
+    sink.NewQuarantineSink(quarantineRepo),                             // 保存 Rejected
+)
+
+result, err := pl.Execute(ctx, rawReadings)
+// result.Accepted / result.Rejected / result.Evaluations
 ```
 
-> 也可通过下游输出端口持久化：`sink.NewRepositorySink(repo, strategy)` 只保存 `Accepted` 数据。若 `WithRepository` 与 `RepositorySink` 指向同一仓储，会在处理前返回"重复持久化目标"配置错误。
+> `WithRepository` 已弃用其持久化语义，仅用于 `GetStandardReading` 查询；Core 的 `Process` 不再自动落库、不再保存隔离数据、不再投递 Sink。
 
 ### 5. 动态规则加载 (Dynamic Rules)
 
@@ -229,23 +238,29 @@ func (r *RefGeRule) CheckWithReferences(in domain.RuleInput) ports.CheckResult {
 - `RELATIVE`：目标时间 = `当前时间 - Offset`（Offset 非负，向历史方向偏移）。
 - `WINDOW`：`[当前时间-Offset, 当前时间)` 内聚合，支持 `AVG`/`SUM`/`MIN`/`MAX`/`LATEST`/`DELTA`。
 
-注册参考规则、注入历史参考源并获取完整结果：
+注册参考规则、注入历史参考源，并通过处理管线获取完整结果：
 
 ```go
 import (
     "github.com/renjie/prism-core/pkg/adapters/reference"
-    "github.com/renjie/prism-core/pkg/adapters/sink"
+    "github.com/renjie/prism-core/pkg/application/pipeline"
     "github.com/renjie/prism-core/pkg/core/services"
 )
 
-// 完整处理接口 (含 Process); 仅标准化可用 NewCoreStandardizer
-std := services.NewEnergyDataProcessor(
+// Core 处理器: 清洗 + 参考解析 + 标准化
+proc := services.NewEnergyDataProcessor(
     services.WithReferenceRules(&RefGeRule{Spec: spec}),                     // ports.ReferenceCleaningRule
     services.WithReferenceSource(reference.NewRepositoryReferenceSource(repo, time.Minute)), // STANDARD_REPO 历史参考源
-    services.WithResultSinks(sink.NewMemorySink()),                          // 可选下游输出
 )
 
-result, err := std.Process(ctx, rawReadings)
+// 应用层管线: 持久化 (Accepted/Rejected) + 其他 Sink
+pl := pipeline.NewProcessingPipeline(
+    proc,
+    sink.NewRepositorySink(repo, ports.UpsertStrategyHighPriorityWins),
+    sink.NewQuarantineSink(quarantineRepo),
+)
+
+result, err := pl.Execute(ctx, rawReadings)
 // result.Accepted    []domain.StandardReading   通过并标准化的数据
 // result.Rejected    []domain.QuarantineReading 被拒绝/隔离的数据
 // result.Evaluations []domain.RuleEvaluation    规则评估 (RuleID / Outcome / Reason / ReferenceIDs)
@@ -256,8 +271,8 @@ result, err := std.Process(ctx, rawReadings)
 - `ReferenceSource` 是参考查询端口（`Resolve(ctx, requests)`），规则不得直接查库。内置实现：`BatchReferenceSource`（当前批次）与 `RepositoryReferenceSource`（历史 `StandardReadingRepository`），单次处理内有内存缓存去重。
 - 声明 `STANDARD_REPO` 参考对象但未配置参考源、或 `RELATIVE`/`WINDOW` 的 `Offset` 为负，都会在处理前返回明确配置错误——参考规则**绝不静默退化**。
 - `SKIP_RULE`/`REJECT`/`QUARANTINE` 仅在"确实查无参考数据"时触发。
-- `RepositorySink` 将 `Accepted` 写入 `StandardReadingRepository`；与 `WithRepository` 指向同一仓储时会报"重复持久化"配置错误。
-- 实现位于 `pkg/adapters/reference` 与 `pkg/adapters/sink`，`pkg/core` 不依赖任何适配器。
+- 持久化与投递属于应用层：`ProcessingPipeline` + `RepositorySink`（Accepted）/ `QuarantineSink`（Rejected）+ 其他 Sink；`WithRepository` 仅用于 `GetStandardReading` 查询，不再写入。
+- 实现位于 `pkg/adapters/reference`、`pkg/adapters/sink` 与 `pkg/application/pipeline`，`pkg/core` 不依赖任何适配器。
 
 ## 🛠 开发与测试
 

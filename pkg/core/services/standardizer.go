@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -15,32 +14,32 @@ import (
 
 // CoreStandardizer 核心数据标准化服务
 // 同时实现旧接口 ports.EnergyDataStandardizer 与新接口 ports.EnergyDataProcessor。
+// Core 只负责: 数据清洗 / 规则执行 / 参考数据解析 / 时间对齐 / 数据标准化 / 生成 ProcessingResult。
+// 持久化、隔离区保存与 Sink 投递由 Application Pipeline (pkg/application/pipeline) 负责。
 type CoreStandardizer struct {
 	sanitizer        *ChainSanitizer
 	aligner          ports.Aligner
 	standardInterval time.Duration
 	precisionFactor  int                             // 精度因子 (默认 10000，即 4 位小数)
 	concurrencyLimit int                             // 并发限制
-	repo             ports.StandardReadingRepository // 可选持久层依赖
+	repo             ports.StandardReadingRepository // 可选查询仓储 (仅供 GetStandardReading)
 	ruleRepo         ports.CleaningRuleRepository    // 可选规则持久层
 	ruleFactory      ports.CleaningRuleFactory       // 可选规则工厂 (动态清洗依赖)
-	quarantineRepo   ports.QuarantineRepository      // 可选隔离区持久层 (for Bad Data)
 
-	// 参考对象与下游输出 (本轮新增)
+	// 参考对象 (本轮新增)
 	cleaningRules   []ports.CleaningRule          // 静态配置的旧规则 (WithCleaningRules)
 	referenceRules  []ports.ReferenceCleaningRule // 静态配置的参考规则 (WithReferenceRules)
 	referenceSource ports.ReferenceSource         // 历史仓储参考源 (可选)
-	resultSinks     []ports.ResultSink            // 下游输出端口
 }
 
 // StandardizerOption 定义配置选项函数 (Functional Option Pattern)
 type StandardizerOption func(*CoreStandardizer)
 
-// WithQuarantineRepository 设置隔离区仓储依赖
+// Deprecated: 隔离数据保存属于 Application Pipeline。
+// Core 不再自动保存隔离数据 (由 ProcessingPipeline + QuarantineSink 负责)。
+// 本选项为无操作，仅保留以避免调用方立即编译失败。
 func WithQuarantineRepository(repo ports.QuarantineRepository) StandardizerOption {
-	return func(s *CoreStandardizer) {
-		s.quarantineRepo = repo
-	}
+	return func(s *CoreStandardizer) {}
 }
 
 // WithRuleRepository 设置规则持久层依赖
@@ -75,7 +74,9 @@ func WithRuleFactory(f ports.CleaningRuleFactory) StandardizerOption {
 	}
 }
 
-// WithRepository 设置持久层依赖
+// Deprecated: 标准数据持久化属于 Application Pipeline。
+// 建议使用 ProcessingPipeline + RepositorySink 写入 Accepted。
+// Core 的 Process 不再自动保存数据；配置的仓储仍用于 GetStandardReading 查询。
 func WithRepository(repo ports.StandardReadingRepository) StandardizerOption {
 	return func(s *CoreStandardizer) {
 		s.repo = repo
@@ -103,11 +104,11 @@ func WithReferenceSource(src ports.ReferenceSource) StandardizerOption {
 	}
 }
 
-// WithResultSinks 设置下游输出端口 (处理结果投递)
+// Deprecated: Sink 投递属于 Application Pipeline。
+// Core 不再自动投递结果 (由 ProcessingPipeline 负责)。
+// 本选项为无操作，仅保留以避免调用方立即编译失败。
 func WithResultSinks(sinks ...ports.ResultSink) StandardizerOption {
-	return func(s *CoreStandardizer) {
-		s.resultSinks = append(s.resultSinks, sinks...)
-	}
+	return func(s *CoreStandardizer) {}
 }
 
 // WithConcurrencyLimit 设置最大并发数 (默认 100)
@@ -176,15 +177,11 @@ func (s *CoreStandardizer) ProcessAndStandardize(ctx context.Context, rawReading
 
 // Process 完整处理流程:
 //  1. 数据清洗 (旧规则 / 参考规则，记录规则评估)
-//  2. 异常数据写入隔离区 (异步)
-//  3. 标准数据并发标准化与持久化
-//  4. 处理结果投递到下游输出端口
+//  2. 标准数据并发标准化与时间对齐
+//
+// Core 只负责生成 ProcessingResult，不执行任何持久化、隔离区保存或 Sink 投递，
+// 这些职责由 Application Pipeline (pkg/application/pipeline) 承担。
 func (s *CoreStandardizer) Process(ctx context.Context, rawReadings []domain.Reading) (domain.ProcessingResult, error) {
-	// Step 0: 配置校验 (持久化冲突检测) —— 处理前 fail-fast
-	if err := s.validatePersistence(); err != nil {
-		return domain.ProcessingResult{}, err
-	}
-
 	// Step 1: A. 数据清洗 (替别人做“脏活累活”)
 	// 剔除空值、负值、重复值和异常跳变
 	// 这一步是批量操作，因为清洗依赖上下文（如前后值的跳变）
@@ -212,26 +209,7 @@ func (s *CoreStandardizer) Process(ctx context.Context, rawReadings []domain.Rea
 		evaluations = cleanRes.Evaluations
 	}
 
-	// 异步保存隔离区数据 (以免阻塞主流程)
-	if len(quarantinedReadings) > 0 && s.quarantineRepo != nil {
-		go func(qs []domain.QuarantineReading) {
-			// 使用带超时的上下文，避免无限阻塞
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			for _, q := range qs {
-				if err := s.quarantineRepo.Save(ctx, q); err != nil {
-					slog.Error("failed to save quarantine reading",
-						"device_id", q.Reading.DeviceInfo.ID,
-						"timestamp", q.Reading.Timestamp,
-						"reason", q.Reason,
-						"error", err)
-				}
-			}
-		}(quarantinedReadings)
-	}
-
-	// Step 3 (Optimization): Concurrency Strategy (Sharding by DeviceID)
+	// Step 2 (Optimization): Concurrency Strategy (Sharding by DeviceID)
 	deviceGroups := make(map[string][]domain.Reading)
 	for _, r := range cleanReadings {
 		deviceGroups[r.DeviceInfo.ID] = append(deviceGroups[r.DeviceInfo.ID], r)
@@ -314,61 +292,11 @@ func (s *CoreStandardizer) Process(ctx context.Context, rawReadings []domain.Rea
 		return domain.ProcessingResult{}, errors.Join(errs...)
 	}
 
-	// Step 3: Persistence (if configured)
-	if s.repo != nil && len(standards) > 0 {
-		// Use Priority-based upsert strategy to respect data governance rules
-		if err := s.repo.SaveBatch(ctx, standards, ports.UpsertStrategyHighPriorityWins); err != nil {
-			return domain.ProcessingResult{}, fmt.Errorf("failed to persist standards: %w", err)
-		}
-	}
-
-	result := domain.ProcessingResult{
+	return domain.ProcessingResult{
 		Accepted:    standards,
 		Rejected:    quarantinedReadings,
 		Evaluations: evaluations,
-	}
-
-	// Step 4: 投递处理结果到下游输出端口
-	// 多个 Sink 投递不是原子操作: 全部执行, 收集所有错误 (每个错误含 Sink ID 与原始错误),
-	// 并始终返回已经生成的 ProcessingResult 供调用方检查与决定是否重试。
-	var sinkErrs []error
-	for _, sink := range s.resultSinks {
-		if err := sink.Deliver(ctx, result); err != nil {
-			sinkErrs = append(sinkErrs, fmt.Errorf("sink %q deliver failed: %w", sink.ID(), err))
-		}
-	}
-	if len(sinkErrs) > 0 {
-		return result, errors.Join(sinkErrs...)
-	}
-
-	return result, nil
-}
-
-// validatePersistence 持久化冲突检测
-// 同一处理结果不得被多个持久化目标重复 SaveBatch:
-//   - WithRepository 直接持久化
-//   - RepositoryAwareSink (如 RepositorySink) 同样持久化 Accepted
-//
-// 同一仓储同时作为直接持久化目标与 Sink 持久化目标时，返回明确配置错误。
-func (s *CoreStandardizer) validatePersistence() error {
-	targets := make(map[ports.StandardReadingRepository]string)
-	if s.repo != nil {
-		targets[s.repo] = "WithRepository"
-	}
-	for _, snk := range s.resultSinks {
-		ra, ok := snk.(ports.RepositoryAwareSink)
-		if !ok {
-			continue
-		}
-		repo := ra.Repository()
-		if src, dup := targets[repo]; dup {
-			return fmt.Errorf(
-				"duplicate persistence target: %s and RepositorySink(%q) both persist to the same StandardReadingRepository; use only one of WithRepository / RepositorySink",
-				src, snk.ID())
-		}
-		targets[repo] = fmt.Sprintf("RepositorySink(%q)", snk.ID())
-	}
-	return nil
+	}, nil
 }
 
 // DefaultScaleFactor 默认精度因子 (支持4位小数精度)

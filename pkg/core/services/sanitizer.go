@@ -43,8 +43,9 @@ func newChainSanitizer(legacy []ports.CleaningRule, refs []ports.ReferenceCleani
 // 返回的 clean 数据已按时间戳升序排列。
 // 该方法仅供旧规则使用; 含参考规则的清洗器必须使用 CleanWithReferences，
 // 否则参考源配置错误会被吞掉 (Clean 无错误返回)。
+// context.TODO() 仅为旧的无上下文 API 提供的占位，不参与任何持久化/投递。
 func (s *ChainSanitizer) Clean(readings []domain.Reading) ([]domain.Reading, []domain.QuarantineReading) {
-	res, _ := s.CleanWithReferences(context.Background(), readings, nil)
+	res, _ := s.CleanWithReferences(context.TODO(), readings, nil)
 	return res.Clean, res.Quarantined
 }
 
